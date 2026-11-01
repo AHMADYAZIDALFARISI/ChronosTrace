@@ -1,0 +1,15 @@
+[package]
+name = "chronostrace-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chronostrace-core = { path = "../chronostrace-core" }
+chronostrace-scrub = { path = "../chronostrace-scrub" }
+chronostrace-chaos = { path = "../chronostrace-chaos" }
+chronostrace-proxy = { path = "../chronostrace-proxy" }
+clap.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,35 @@
+{
+    "name": "@chronostrace/test",
+
+
+
+
+    "version": "0.1.0",
+    "description": "Deterministic DAG replay and MCP chaos fault injection harness for Vitest, Jest, and Playwright",
+    "license": "Apache-2.0",
+    "type": "module",
+    "main": "./dist/index.cjs",
+    "module": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "files": [
+       "dist"
+    ],
+    "scripts": {
+       "build": "tsup src/index.ts --format esm,cjs --dts",
+       "typecheck": "tsc --noEmit",
+       "test": "vitest run"
+    },
+    "optionalDependencies": {
+       "@chronostrace/cli-linux-x64-musl": "0.1.0",
+       "@chronostrace/cli-linux-arm64-musl": "0.1.0",
+       "@chronostrace/cli-darwin-x64": "0.1.0",
+       "@chronostrace/cli-darwin-arm64": "0.1.0",
+       "@chronostrace/cli-win32-x64-msvc": "0.1.0"
+    },
+    "devDependencies": {
+       "@types/node": "^22.0.0",
+       "tsup": "^8.2.0",
+       "typescript": "^5.5.0",
+       "vitest": "^2.0.0"
+    }
+}

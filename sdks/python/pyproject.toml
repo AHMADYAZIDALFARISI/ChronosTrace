@@ -1,0 +1,37 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pytest-chronostrace"
+version = "0.1.0"
+description = "Deterministic VCR replay, semantic cassette matching, and chaos fault injection for LLM and MCP workf
+readme = "../../README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "pytest>=7.4.0",
+]
+classifiers = [
+    "Framework :: Pytest",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "httpx>=0.27.0",
+]
+
+[project.entry-points.pytest11]
+chronostrace = "pytest_chronostrace.plugin"
+
+[tool.maturin]
+manifest-path = "../../crates/chronostrace-cli/Cargo.toml"
+bindings = "bin"
+python-source = "."
+module-name = "pytest_chronostrace"
+strip = true

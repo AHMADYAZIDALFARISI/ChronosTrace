@@ -1,0 +1,14 @@
+[package]
+name = "chronostrace-proxy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chronostrace-core = { path = "../chronostrace-core" }
+chronostrace-scrub = { path = "../chronostrace-scrub" }
+chronostrace-chaos = { path = "../chronostrace-chaos" }
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
