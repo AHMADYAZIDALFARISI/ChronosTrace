@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/chronostrace-core",
+
+
+
+
+      "crates/chronostrace-scrub",
+      "crates/chronostrace-chaos",
+      "crates/chronostrace-proxy",
+      "crates/chronostrace-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/chronostrace/chronostrace"
+rust-version = "1.78"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "1.0"
+regex = "1.10"
+tokio = { version = "1.38", features = ["full"] }
+axum = "0.7"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
