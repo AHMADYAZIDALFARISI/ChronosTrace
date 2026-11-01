@@ -227,8 +227,8 @@ pub fn diff_json_values(prefix: &str, base: &Value, cand: &Value, out: &mut Vec<
                 let next_path = format!("{prefix}.{key}");
                 match (b_map.get(key), c_map.get(key)) {
                     (Some(bv), Some(cv)) => diff_json_values(&next_path, bv, cv, out),
-                    (Some(bv), None) => out.push(FieldDelta { path: next_path, baseline_value: bv.clone(), candidate
-                    (None, Some(cv)) => out.push(FieldDelta { path: next_path, baseline_value: Value::Null, candidat
+                    (Some(bv), None) => out.push(FieldDelta { path: next_path, baseline_value: bv.clone(), candidate_value: Value::Null }),
+                    (None, Some(cv)) => out.push(FieldDelta { path: next_path, baseline_value: Value::Null, candidate_value: cv.clone() }),
                     (None, None) => unreachable!(),
                 }
             }
@@ -239,13 +239,13 @@ pub fn diff_json_values(prefix: &str, base: &Value, cand: &Value, out: &mut Vec<
                 let next_path = format!("{prefix}[{i}]");
                 match (b_arr.get(i), c_arr.get(i)) {
                     (Some(bv), Some(cv)) => diff_json_values(&next_path, bv, cv, out),
-                    (Some(bv), None) => out.push(FieldDelta { path: next_path, baseline_value: bv.clone(), candidate
-                    (None, Some(cv)) => out.push(FieldDelta { path: next_path, baseline_value: Value::Null, candidat
+                    (Some(bv), None) => out.push(FieldDelta { path: next_path, baseline_value: bv.clone(), candidate_value: Value::Null }),
+                    (None, Some(cv)) => out.push(FieldDelta { path: next_path, baseline_value: Value::Null, candidate_value: cv.clone() }),
                     (None, None) => unreachable!(),
                 }
             }
         }
-        _ => out.push(FieldDelta { path: prefix.to_string(), baseline_value: base.clone(), candidate_value: cand.clo
+        _ => out.push(FieldDelta { path: prefix.to_string(), baseline_value: base.clone(), candidate_value: cand.clone() }),
     }
 }
 

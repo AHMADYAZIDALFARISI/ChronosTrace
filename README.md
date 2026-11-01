@@ -4,10 +4,10 @@
 
 **Deterministic VCR Replay, Semantic Cassette Matching, and Chaos Fault Injection for Multi-Agent & MCP Workflows**
 
-[![CI](https://img.shields.io/github/actions/workflow/status/chronostrace/chronostrace/ci.yml?branch=main&label=CI&l
-[![Crates.io](https://img.shields.io/crates/v/chronostrace-cli?logo=rust&label=crates.io)](https://crates.io/crates/
-[![PyPI](https://img.shields.io/pypi/v/pytest-chronostrace?logo=python&label=pytest-chronostrace)](https://pypi.org/
-[![npm](https://img.shields.io/npm/v/@chronostrace/test?logo=npm&label=%40chronostrace%2Ftest)](https://www.npmjs.co
+[![CI](https://img.shields.io/github/actions/workflow/status/chronostrace/chronostrace/ci.yml?branch=main&label=CI&logo=github)](https://github.com/chronostrace/chronostrace/actions)
+[![Crates.io](https://img.shields.io/crates/v/chronostrace-cli?logo=rust&label=crates.io)](https://crates.io/crates/chronostrace-cli)
+[![PyPI](https://img.shields.io/pypi/v/pytest-chronostrace?logo=python&label=pytest-chronostrace)](https://pypi.org/project/pytest-chronostrace/)
+[![npm](https://img.shields.io/npm/v/@chronostrace/test?logo=npm&label=%40chronostrace%2Ftest)](https://www.npmjs.com/package/@chronostrace/test)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 
 [**60-Second Quickstart**](#-60-second-quickstart) •

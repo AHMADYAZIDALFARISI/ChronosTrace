@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "pytest-chronostrace"
 version = "0.1.0"
-description = "Deterministic VCR replay, semantic cassette matching, and chaos fault injection for LLM and MCP workf
+description = "Deterministic VCR replay, semantic cassette matching, and chaos fault injection for LLM and MCP workflows"
 readme = "../../README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"

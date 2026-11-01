@@ -55,18 +55,18 @@ jobs:
 
 
 
-                 use_zigbuild: false
-                 archive_ext: tar.gz
-                 bin_name: chronostrace
-                 npm_dir: cli-darwin-arm64
-               - target: x86_64-pc-windows-msvc
-                 os: windows-latest
-                 use_zigbuild: false
-                 archive_ext: zip
-                 bin_name: chronostrace.exe
-                 npm_dir: cli-win32-x64-msvc
+            use_zigbuild: false
+            archive_ext: tar.gz
+            bin_name: chronostrace
+            npm_dir: cli-darwin-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_zigbuild: false
+            archive_ext: zip
+            bin_name: chronostrace.exe
+            npm_dir: cli-win32-x64-msvc
 
-     steps:
+    steps:
        - name: Checkout repository
          uses: actions/checkout@v4
 
@@ -148,185 +148,185 @@ jobs:
    # ---------------------------------------------------------------------------
    # 2. Publish GitHub Release with Aggregated SHA256SUMS
    # ---------------------------------------------------------------------------
-   publish-github-release:
-     name: Create GitHub Release
-     needs: build-binaries
-     if: startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true'
-     runs-on: ubuntu-latest
-     steps:
-       - name: Download all release archives
-         uses: actions/download-artifact@v4
-         with:
-            pattern: release-archive-*
-            path: release-assets
-            merge-multiple: true
+  publish-github-release:
+    name: Create GitHub Release
+    needs: build-binaries
+    if: startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all release archives
+        uses: actions/download-artifact@v4
+        with:
+           pattern: release-archive-*
+           path: release-assets
+           merge-multiple: true
 
-       - name: Generate unified SHA256SUMS manifest
-         working-directory: release-assets
-         run: |
-           cat *.sha256 > SHA256SUMS
-           cat SHA256SUMS
+      - name: Generate unified SHA256SUMS manifest
+        working-directory: release-assets
+        run: |
+          cat *.sha256 > SHA256SUMS
+          cat SHA256SUMS
 
-       - name: Publish GitHub Release
-         uses: softprops/action-gh-release@v2
-         with:
-           generate_release_notes: true
-           files: |
-             release-assets/*.tar.gz
-             release-assets/*.zip
-             release-assets/*.sha256
-             release-assets/SHA256SUMS
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/*.tar.gz
+            release-assets/*.zip
+            release-assets/*.sha256
+            release-assets/SHA256SUMS
 
-   # ---------------------------------------------------------------------------
-   # 3. Build Multi-Platform Python Wheels (maturin) & Publish to PyPI
-   # ---------------------------------------------------------------------------
-   build-python-wheels:
-     name: Build Python Wheel (${{ matrix.target }})
-     runs-on: ${{ matrix.os }}
-     strategy:
-       fail-fast: false
-       matrix:
-         include:
-            - os: ubuntu-latest
-              target: x86_64
-              manylinux: "2_28"
-            - os: ubuntu-latest
-              target: aarch64
-              manylinux: "2_28"
-            - os: macos-13
-              target: x86_64
-              manylinux: ""
-            - os: macos-14
-              target: aarch64
-              manylinux: ""
-            - os: windows-latest
-              target: x64
-              manylinux: ""
-     steps:
-       - name: Checkout repository
-         uses: actions/checkout@v4
+  # ---------------------------------------------------------------------------
+  # 3. Build Multi-Platform Python Wheels (maturin) & Publish to PyPI
+  # ---------------------------------------------------------------------------
+  build-python-wheels:
+    name: Build Python Wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+           - os: ubuntu-latest
+             target: x86_64
+             manylinux: "2_28"
+           - os: ubuntu-latest
+             target: aarch64
+             manylinux: "2_28"
+           - os: macos-13
+             target: x86_64
+             manylinux: ""
+           - os: macos-14
+             target: aarch64
+             manylinux: ""
+           - os: windows-latest
+             target: x64
+             manylinux: ""
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-       - name: Set up Python 3.12
-         uses: actions/setup-python@v5
-         with:
-           python-version: "3.12"
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-       - name: Build wheel embedding chronostrace binary via maturin
-         uses: PyO3/maturin-action@v1
-         with:
-           target: ${{ matrix.target }}
-           working-directory: sdks/python
-           args: --release --out dist
-           sccache: "true"
-
-
-
-
-
-               manylinux: ${{ matrix.manylinux }}
-
-       - name: Upload built wheels
-         uses: actions/upload-artifact@v4
-         with:
-           name: python-wheels-${{ matrix.os }}-${{ matrix.target }}
-           path: sdks/python/dist/*.whl
-
-   publish-pypi:
-     name: Publish to PyPI (OIDC Trusted Publisher)
-     needs: [build-python-wheels]
-     if: startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true'
-     runs-on: ubuntu-latest
-     environment:
-       name: pypi
-       url: https://pypi.org/p/pytest-chronostrace
-     steps:
-       - name: Download all built wheels
-         uses: actions/download-artifact@v4
-         with:
-            pattern: python-wheels-*
-            path: dist
-            merge-multiple: true
-
-       - name: Publish wheels to PyPI via Trusted Publisher
-         uses: pypa/gh-action-pypi-publish@release/v1
-         with:
-           packages-dir: dist/
-           attestations: true
-
-   # ---------------------------------------------------------------------------
-   # 4. Stage Platform Binaries & Publish @chronostrace/test to npm
-   # ---------------------------------------------------------------------------
-   publish-npm:
-     name: Publish @chronostrace/test to npm
-     needs: [build-binaries]
-     if: startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true'
-     runs-on: ubuntu-latest
-     environment:
-       name: npm
-       url: https://www.npmjs.com/package/@chronostrace/test
-     steps:
-       - name: Checkout repository
-         uses: actions/checkout@v4
-
-       - name: Set up Node.js 22 with npm registry auth
-         uses: actions/setup-node@v4
-         with:
-           node-version: "22.x"
-           registry-url: "https://registry.npmjs.org"
-
-       - name: Download all raw platform binaries
-         uses: actions/download-artifact@v4
-         with:
-           pattern: raw-bin-*
-           path: npm-binaries
-
-       - name: Stage and publish platform binary packages + root SDK package
-         working-directory: sdks/typescript
-         env:
-           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-           RELEASE_VERSION: ${{ github.ref_name }}
-         run: |
-           CLEAN_VERSION="${RELEASE_VERSION#v}"
-
-               # Publish each platform-specific binary package
-               for PLATFORM_DIR in ../../npm-binaries/raw-bin-*; do
-                 PKG_SUFFIX="${PLATFORM_DIR##*raw-bin-}"
-                 mkdir -p "npm-platforms/${PKG_SUFFIX}/bin"
-                 cp "${PLATFORM_DIR}"/* "npm-platforms/${PKG_SUFFIX}/bin/"
-                 chmod +x "npm-platforms/${PKG_SUFFIX}/bin/"* || true
-
-                 node -e '
-                   const fs = require("fs");
-                   const suffix = process.argv[1];
-                   const version = process.argv[2];
-                   const [_, osName, cpuArch, libc] = suffix.split("-");
-                   const pkg = {
-                     name: `@chronostrace/${suffix}`,
+      - name: Build wheel embedding chronostrace binary via maturin
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          working-directory: sdks/python
+          args: --release --out dist
+          sccache: "true"
 
 
 
 
 
-                     version,
-                     description: `Native ChronosTrace binary for ${suffix}`,
-                     license: "Apache-2.0",
-                     repository: {
-                        type: "git",
-                        url: "git+https://github.com/chronostrace/chronostrace.git"
-                     },
-                     os: [osName],
-                     cpu: [cpuArch],
-                     ...(libc === "musl" ? { libc: ["musl"] } : {}),
-                     files: ["bin"]
-                   };
-                   fs.writeFileSync(`npm-platforms/${suffix}/package.json`, JSON.stringify(pkg, null, 2));
-                 ' "${PKG_SUFFIX}" "${CLEAN_VERSION}"
+          manylinux: ${{ matrix.manylinux }}
 
-                 (cd "npm-platforms/${PKG_SUFFIX}" && npm publish --access public --provenance)
-               done
+      - name: Upload built wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: sdks/python/dist/*.whl
 
-               # Sync root @chronostrace/test version and publish with provenance
-               npm version "${CLEAN_VERSION}" --no-git-tag-version
-               npm ci
-               npm run build
-               npm publish --access public --provenance
+  publish-pypi:
+    name: Publish to PyPI (OIDC Trusted Publisher)
+    needs: [build-python-wheels]
+    if: startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pytest-chronostrace
+    steps:
+      - name: Download all built wheels
+        uses: actions/download-artifact@v4
+        with:
+           pattern: python-wheels-*
+           path: dist
+           merge-multiple: true
+
+      - name: Publish wheels to PyPI via Trusted Publisher
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          attestations: true
+
+  # ---------------------------------------------------------------------------
+  # 4. Stage Platform Binaries & Publish @chronostrace/test to npm
+  # ---------------------------------------------------------------------------
+  publish-npm:
+    name: Publish @chronostrace/test to npm
+    needs: [build-binaries]
+    if: startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@chronostrace/test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22 with npm registry auth
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download all raw platform binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: raw-bin-*
+          path: npm-binaries
+
+      - name: Stage and publish platform binary packages + root SDK package
+        working-directory: sdks/typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          CLEAN_VERSION="${RELEASE_VERSION#v}"
+
+              # Publish each platform-specific binary package
+              for PLATFORM_DIR in ../../npm-binaries/raw-bin-*; do
+                PKG_SUFFIX="${PLATFORM_DIR##*raw-bin-}"
+                mkdir -p "npm-platforms/${PKG_SUFFIX}/bin"
+                cp "${PLATFORM_DIR}"/* "npm-platforms/${PKG_SUFFIX}/bin/"
+                chmod +x "npm-platforms/${PKG_SUFFIX}/bin/"* || true
+
+                node -e '
+                  const fs = require("fs");
+                  const suffix = process.argv[1];
+                  const version = process.argv[2];
+                  const [_, osName, cpuArch, libc] = suffix.split("-");
+                  const pkg = {
+                    name: `@chronostrace/${suffix}`,
+
+
+
+
+
+                    version,
+                    description: `Native ChronosTrace binary for ${suffix}`,
+                    license: "Apache-2.0",
+                    repository: {
+                       type: "git",
+                       url: "git+https://github.com/chronostrace/chronostrace.git"
+                    },
+                    os: [osName],
+                    cpu: [cpuArch],
+                    ...(libc === "musl" ? { libc: ["musl"] } : {}),
+                    files: ["bin"]
+                  };
+                  fs.writeFileSync(`npm-platforms/${suffix}/package.json`, JSON.stringify(pkg, null, 2));
+                ' "${PKG_SUFFIX}" "${CLEAN_VERSION}"
+
+                (cd "npm-platforms/${PKG_SUFFIX}" && npm publish --access public --provenance)
+              done
+
+              # Sync root @chronostrace/test version and publish with provenance
+              npm version "${CLEAN_VERSION}" --no-git-tag-version
+              npm ci
+              npm run build
+              npm publish --access public --provenance
