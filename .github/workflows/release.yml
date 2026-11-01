@@ -312,7 +312,7 @@ jobs:
                     license: "Apache-2.0",
                     repository: {
                        type: "git",
-                       url: "git+https://github.com/chronostrace/chronostrace.git"
+                       url: "git+https://github.com/AHMADYAZIDALFARISI/ChronosTrace.git"
                     },
                     os: [osName],
                     cpu: [cpuArch],

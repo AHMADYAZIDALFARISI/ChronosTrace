@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/AHMADYAZIDALFARISI/project-genesis/schemas/ctrace-v1.schema.json",
+  "$id": "https://github.com/AHMADYAZIDALFARISI/ChronosTrace/schemas/ctrace-v1.schema.json",
   "title": "ChronosTrace Cassette v1",
   "type": "object",
   "required": ["version", "cassette_id", "metadata", "nodes"],
