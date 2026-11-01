@@ -1,0 +1,16 @@
+/target/
+**/*.rs.bk
+node_modules/
+sdks/typescript/dist/
+sdks/typescript/npm-platforms/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+sdks/python/dist/
+sdks/python/build/
+*.egg-info/
+.venv/
+phase0_dump.txt
+*.tmp
+.DS_Store

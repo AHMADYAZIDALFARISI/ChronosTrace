@@ -1,395 +1,322 @@
-<div align="center">
+# ChronosTrace
 
-# ⏱️ ChronosTrace
+Deterministic VCR replay, graph-aware trajectory diffing, and chaos fault
+injection for LLM and MCP workflows.
 
-**Deterministic VCR Replay, Semantic Cassette Matching, and Chaos Fault Injection for Multi-Agent & MCP Workflows**
-
-[![CI](https://img.shields.io/github/actions/workflow/status/chronostrace/chronostrace/ci.yml?branch=main&label=CI&logo=github)](https://github.com/chronostrace/chronostrace/actions)
-[![Crates.io](https://img.shields.io/crates/v/chronostrace-cli?logo=rust&label=crates.io)](https://crates.io/crates/chronostrace-cli)
-[![PyPI](https://img.shields.io/pypi/v/pytest-chronostrace?logo=python&label=pytest-chronostrace)](https://pypi.org/project/pytest-chronostrace/)
-[![npm](https://img.shields.io/npm/v/@chronostrace/test?logo=npm&label=%40chronostrace%2Ftest)](https://www.npmjs.com/package/@chronostrace/test)
+[![CI](https://github.com/AHMADYAZIDALFARISI/project-genesis/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/AHMADYAZIDALFARISI/project-genesis/actions)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 
-[**60-Second Quickstart**](#-60-second-quickstart) •
-[**Why ChronosTrace?**](#-why-chronostrace) •
-[**Architecture**](#-how-it-works-architecture) •
-[**Chaos Fault Injection**](#-chaos-fault-injection) •
-[**Trajectory Diffing**](#-trajectory-diffing-chronostrace-diff) •
-[**CLI Reference**](#-cli-reference)
+ChronosTrace records multi-turn LLM and Model Context Protocol (MCP) tool
+trajectories into content-addressed `.ctrace` cassettes and replays them
+deterministically offline. It is written in Rust, with a Python `pytest`
+plugin and a TypeScript SDK for Vitest.
 
-</div>
+Repository: https://github.com/AHMADYAZIDALFARISI/project-genesis
+Default branch: `master`
+Version: `0.1.0`
 
----
+## Why ChronosTrace?
 
+- **Deterministic offline replay.** Replace live LLM API calls in tests with
+  recorded cassettes, so the same trajectory returns the same response.
+- **Safety-first matching.** Minor prompt phrasing edits can be tolerated
+  through SimHash matching, while safety-critical values must match exactly
+  (see “Three-tier matching” below).
+- **MCP stdio interception.** `chronostrace mcp-wrap` wraps an MCP
+  JSON-RPC 2.0 stdio server for recording, replay, and chaos injection,
+  normalizing volatile request IDs.
+- **Seeded chaos engineering.** Inject rate limits, outages, latency,
+  truncated payloads, and dropped fields to exercise retry and
+  circuit-breaker logic deterministically.
+- **Verified secret scrubbing.** Sensitive keys, headers, key patterns, and
+  high-entropy tokens are redacted before a cassette is written, and the
+  scrubber policy version and redaction count are recorded in metadata.
 
+## Repository layout
 
+```text
+chronostrace/
+├── crates/
+│   ├── chronostrace-core/     # DAG state machine, SimHash, trajectory diff
+│   ├── chronostrace-scrub/    # Secret scrubbing (regex + Shannon entropy)
+│   ├── chronostrace-chaos/    # Seeded deterministic fault-injection engine
+│   ├── chronostrace-proxy/    # HTTP replay server and MCP stdio wrapper
+│   └── chronostrace-cli/      # CLI entry point and diff renderer
+├── sdks/
+│   ├── python/                # pytest-chronostrace plugin
+│   └── typescript/            # @chronostrace/test SDK for Vitest
+├── schemas/
+│   └── ctrace-v1.schema.json  # JSON Schema for .ctrace cassette files
+├── examples/
+│   └── langgraph-refund-agent/  # Multi-turn refund agent under chaos faults
+├── docs/
+│   ├── architecture.md
+│   ├── cassette-format.md
+│   └── compatibility.md
+├── AUDIT_FINDINGS.md
+├── IMPLEMENTATION_PLAN.md
+├── SECURITY_THREAT_MODEL.md
+└── CHANGELOG.md
+```
 
+## Building the CLI
 
-
-**ChronosTrace** is a single-binary protocol interceptor and CI testing harness written in Rust (with native **Pytes
-
-Stop burning API credits in CI, fighting flaky agent integration tests, or guessing whether your agent will enter a
-
----
-
-## ⚡ Why ChronosTrace?
-
-Testing stateful, multi-turn AI agents in CI/CD is fundamentally broken with traditional tooling:
-1. **Live LLM calls in CI are slow, flaky, and expensive.** A 10-step agent workflow takes 15–40 seconds per test an
-2. **Naive HTTP record/replay tools (`VCR.py`, `Polly.JS`) are brittle.** Changing a single punctuation mark or form
-3. **Standard HTTP mocks cannot intercept MCP `stdio` subprocesses.** MCP servers communicate over bidirectional new
-4. **Happy-path evaluations hide catastrophic failure modes.** Cloud evaluation dashboards score prompt accuracy on
-
-### How ChronosTrace Compares
-
-| Capability | VCR.py / Polly.JS | Promptfoo / DeepEval | LangSmith / Phoenix | **ChronosTrace** |
-|---|:---:|:---:|:---:|:---:|
-| **100% Offline, Sub-2ms CI Replay** | ✅ | ❌ (Calls live APIs) | ❌ (Cloud SaaS) | **✅ (Rust Core)** |
-| **Tolerates Minor Prompt Edits (SimHash)** | ❌ (Brittle byte hash) | N/A | N/A | **✅ (3-Tier DAG Matcher)** |
-| **Native MCP `stdio` & SSE Interception** | ❌ | ❌ | Partial (Tracing only) | **✅ (`mcp-wrap`)** |
-| **Deterministic Chaos Fault Injection** | ❌ | ❌ | ❌ | **✅ (Seeded PRNG)** |
-| **Git-Friendly Trajectory Diff CLI** | ❌ | ❌ | Web UI only | **✅ (`chronostrace diff`)** |
-| **Automatic Secret & High-Entropy Scrubbing** | Manual | Manual | Cloud-stored | **✅ (Built-in)** |
-
----
-
-## 📦 Installation
-
-ChronosTrace ships pre-compiled native binaries embedded directly inside its Python wheels and npm packages—**no loc
-
-### Python (`pytest` plugin + CLI)
 ```bash
-pip install pytest-chronostrace
-# or with uv:
-uv add --dev pytest-chronostrace
+git clone https://github.com/AHMADYAZIDALFARISI/project-genesis.git
+cd project-genesis
+cargo build --release --package chronostrace-cli
+./target/release/chronostrace --version
+```
 
-TypeScript / Node.js (Vitest / Jest SDK + CLI)
+The binary is named `chronostrace` (single executable, via `[[bin]]` in
+`crates/chronostrace-cli/Cargo.toml`).
 
-npm install -D @chronostrace/test
-# or with pnpm / bun:
-pnpm add -D @chronostrace/test
+## CLI reference
 
-Standalone CLI (Rust / Cargo / Homebrew)
-
-cargo install chronostrace-cli --locked
-
-
-🚀 60-Second Quickstart
-1. Record an MCP Server or Agent Trajectory Once
-
-Wrap any MCP stdio server (or point your LLM client to the ChronosTrace proxy) in record mode. ChronosTrace captures the full multi-turn
-DAG, strips volatile JSON-RPC IDs, redacts API keys/secrets, and writes a clean .ctrace cassette:
-
-chronostrace mcp-wrap \
-  --mode record \
-  --cassette cassettes/refund_flow.ctrace \
-  -- npx -y @modelcontextprotocol/server-postgres postgresql://localhost/shop
-
-2. Replay & Inject Chaos Faults in Python (pytest)
-
-Decorate any test with @pytest.mark.chronostrace. It executes in < 15ms with zero network calls and zero API cost:
-
-import pytest
-from my_app.agent import run_refund_agent
-
-# 1. Deterministic offline regression test (tolerates minor prompt edits >= 0.85 SimHash)
-@pytest.mark.chronostrace("cassettes/refund_flow.ctrace")
-def test_refund_agent_happy_path():
-    result = run_refund_agent(order_id="ORD-900")
-    assert result.status == "REFUND_COMPLETED"
-    assert result.refund_id == "REF-2026-881"
-
-# 2. Chaos test: Verify exponential backoff when OpenAI returns HTTP 429 bursts
-@pytest.mark.chronostrace("cassettes/refund_flow.ctrace", chaos_rate_limit_prob=0.65)
-def test_refund_agent_survives_rate_limits():
-
-
-
-
-
-
-     result = run_refund_agent(order_id="ORD-900", max_retries=5)
-     assert result.status == "REFUND_COMPLETED"
-
-3. Replay & Test MCP Circuit Breakers in TypeScript (Vitest)
-
-import { describe, expect, it } from "vitest";
-import { withChronosTrace, McpStdioTestClient } from "@chronostrace/test";
-import { runRefundAgentWorkflow } from "./agent.js";
-
-describe("Order Refund Agent Resilience", () => {
-  it("escalates safely instead of hallucinating when MCP payment server returns 503", async () => {
-    await withChronosTrace({ cassette: "cassettes/refund_llm.ctrace" }, async (ctx) => {
-      const mcpClient = new McpStdioTestClient({
-        cassette: "cassettes/refund_mcp.ctrace",
-        chaosServiceOutageProb: 1.0, // Inject 100% MCP 503 Service Outage
-      });
-      await mcpClient.start();
-
-       try {
-         const res = await runRefundAgentWorkflow("ORD-900", "Refund my damaged order", {
-           llmBaseUrl: ctx.openAiBaseUrl,
-           mcpClient,
-         });
-
-        expect(res.status).toBe("ESCALATED_TO_HUMAN_TICKET");
-        expect(res.refundId).toBeNull();
-      } finally {
-        await mcpClient.close();
-      }
-    });
-  });
-});
-
-
-🏗️ How It Works: Architecture
-ChronosTrace intercepts traffic at the protocol boundary—supporting OpenAI/Anthropic/vLLM HTTP/SSE endpoints and MCP JSON-RPC 2.0
-stdio streams—and evaluates every step against a content-addressed Directed Acyclic Graph (DAG).
-
-+-------------------------------------------------------------------------+
-|                    Developer Test Suite (pytest / Vitest)                |
-|        @chronostrace(cassette="refund_agent.ctrace", chaos="flaky_db") |
-+------------------------------------+------------------------------------+
-                                      |
-                   +-----------------v-----------------+
-                   |     Application / Agent Runtime    |
-                   | (LangGraph / Custom Loop / SDKs) |
-                   +--------+-----------------+--------+
-                             |                 |
-          LLM HTTP/SSE Calls|                  |MCP stdio / JSON-RPC Calls
-                             v                 v
-+-------------------------------------------------------------------------+
-|                       ChronosTrace Core Engine (Rust)                    |
-|                                                                          |
-| +---------------------------+         +-------------------------------+ |
-| | Protocol Normalizer         |       | Secret & PII Scrubber         | |
-| | - OpenAI / Anthropic AST |------>| - API Key & Bearer Redactor | |
-| | - MCP JSON-RPC (strip id)|          | - Shannon Entropy Filter      | |
-| +---------------------------+         +---------------+---------------+ |
-|                                                       |                  |
-|                                                       v                  |
-| +-------------------------------------------------------------------+ |
-| |             Three-Tier Stateful DAG Trajectory Matcher              | |
-| | Tier 1: Exact Parent Node + Canonical Request SHA-256               | |
-| | Tier 2: Exact Parent + Tool Schema Hash + 64-bit Prompt SimHash | |
-| | Tier 3: Passthrough Live Re-Record (or Strict CI Fail)              | |
-| +-----------------+---------------------------------+---------------+ |
-|                     | (Replay Hit)                    | (Record Mode)    |
-|                     v                                 v                  |
-| +-----------------------------------+     +---------------------------+ |
-| |      Chaos Fault Injection Engine |     | Upstream Live API / MCP   | |
-| | - Seeded Xorshift64* PRNG           |   +-------------+-------------+ |
-| | - HTTP 429 / MCP 503 Outages        |                 |                |
-| | - Latency Spikes & JSON Corrupt |                     |                |
-| +-----------------+-----------------+                   |                |
-|                     |                                   |                |
-|                     +-----------------+-----------------+                |
-|                                       v                                  |
-|                     +-----------------------------------+                |
-
-
-
-
-
-|                    |   .ctrace Content-Addressed Store |                |
-|                    +-----------------------------------+                |
-+-------------------------------------------------------------------------+
-
-The Three-Tier Deterministic DAG Matcher
-Unlike naive HTTP caches that hash raw request bytes, ChronosTrace matches each turn in context of its parent node in the conversation DAG:
-
-      Tier 1 (Exact Canonical Hash): Recursively sorts JSON keys, strips volatile JSON-RPC request id counters, and checks for a SHA-256
-      match at the current DAG parent pointer.
-
-      Tier 2 (Structural Tool Equivalence + Lexical SimHash): If a developer fixes a typo or tweaks phrasing in a system prompt, Tier 2
-      verifies that the available tool definitions and prior tool outputs match 100%, then computes a 64-bit FNV-1a 3-word shingle SimHash
-      over the prompt text. If Hamming similarity meets the cassette threshold (default >= 0.85), ChronosTrace reconciles the drift, logs a CI
-      notice, and replays the recorded response.
-
-      Tier 3 (Strict Offline Miss or Selective Branch Recording): In CI (--mode replay), an unmatched branch fails immediately with
-      diagnostic similarity scores. Locally (--mode passthrough), ChronosTrace replays cached ancestor nodes and only invokes the live
-      LLM/MCP server for the newly diverged branch.
-
-
-💥 Chaos Fault Injection
-All chaos faults are driven by a deterministic Xorshift64 PRNG* seeded in your test configuration—meaning when a chaos run uncovers an
-agent bug in CI, any developer can replay that exact failure sequence locally using the same seed.
-
-
-  Fault Profile               Protocol Behavior                                    What It Verifies in Your Agent
-
-                              Injects 429 Too Many Requests with
-  Http429RateLimit                                                                 Exponential backoff, jitter, and token-bucket retry budgets
-                              retry_after metadata
-
-                              Returns HTTP 503 or MCP isError: true tool           Circuit breakers, fallback tools, and prevention of
-  ServiceUnavailable503
-                              result                                               hallucinated tool success
-
-                                                                                   Async cancellation safety, timeout guards, and parallel tool
-  LatencySpike                Delays response by configurable delay_ms
-                                                                                   fan-out deadlines
-
-                              Slices serialized JSON payload mid-stream
-  TruncatedJsonPayload                                                             Parser resilience and structured output recovery prompts
-                              (keep_ratio)
-
-                              Removes a specified key from a tool response         Pydantic / Zod runtime schema validation and graceful
-  DropSchemaField
-                              object                                               degradation
-
-
-🔍 Trajectory Diffing (chronostrace diff)
-Compare two .ctrace cassettes in your terminal or CI pipeline to see whether a pull request altered agent branching, mutated tool arguments,
-or merely tweaked prompt wording:
-
-chronostrace diff cassettes/baseline.ctrace cassettes/candidate.ctrace
-
-ChronosTrace Trajectory Comparison
-  Baseline : refund_baseline (3 steps, 463 ms)
-  Candidate: refund_candidate (3 steps, 436 ms)
-
-├── Step 01 [PROMPT DRIFT (RECONCILED)] llm:gpt-4o (sim=0.91, Δt=-30ms)
-├── Step 02 [EXACT MATCH] mcp:tools/call(verify_order) (sim=1.00, Δt=+0ms)
-└── Step 03 [TOOL ARG MUTATED] mcp:tools/call(issue_refund) (sim=1.00, Δt=+3ms)
-      - request.params.arguments.amount: 50.0
-      + request.params.arguments.amount: 500.0
-
-Summary: 1 identical, 1 reconciled drift, 1 arg mutations, 0 response diffs, 0 topology breaks -> FAIL (Breaking Tra
-
-Generate a GitHub Flavored Markdown table directly into your pull request summary:
-
-chronostrace diff baseline.ctrace candidate.ctrace --format markdown >> $GITHUB_STEP_SUMMARY
-
-
-🛠️ CLI Reference
+```text
 Usage: chronostrace <COMMAND>
 
 Commands:
-  replay          Start deterministic offline HTTP replay proxy for LLM & MCP calls
-  mcp-wrap        Wrap an MCP stdio server for recording, offline virtualization, or chaos injection
-  diff            Compare two .ctrace cassettes and detect topological or argument regressions
-  verify          Verify cassette integrity and confirm zero unredacted secrets
-  help            Print this message or the help of the given subcommand(s)
+  replay    Start deterministic offline HTTP replay proxy for LLM & MCP calls
+  mcp-wrap  Wrap an MCP stdio server for recording, offline replay, or chaos injection
+  diff      Compare two .ctrace cassettes and detect trajectory regressions
+  verify    Verify cassette integrity and confirm scrubbing metadata
+  help      Print this message or the help of the given subcommand(s)
 
-Key Exit Codes
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
 
+### `replay`
 
+```bash
+chronostrace replay --cassette cassette.ctrace --bind 127.0.0.1:8787
+```
 
+Options verified from `--help`:
 
+- `--cassette <CASSETTE>` (required)
+- `--bind <BIND>` (default: `127.0.0.1:8787`)
+- `--chaos-rate-limit-prob <PROB>` (inject HTTP 429 faults with this
+  probability)
 
-      0: Replay verified or trajectory diff is 100% behaviorally compatible.
+The replay server serves OpenAI-compatible paths under `/v1` and MCP HTTP
+calls under `/mcp/call`. A request with no matching recorded node returns
+HTTP `412` (`CHRONOSTRACE_REPLAY_MISS`).
 
-      1: Runtime, configuration, or I/O error.
+### `mcp-wrap`
 
-      2: Breaking trajectory divergence detected by chronostrace diff (ToolArgumentMutated, ResponseDiverged, or TopologyDiverged).
+```bash
+# Record
+chronostrace mcp-wrap --mode record --cassette cassette.ctrace -- <child-command>
 
+# Replay (default mode)
+chronostrace mcp-wrap --mode replay --cassette cassette.ctrace
+```
 
-🔒 Security & Secret Scrubbing
-.ctrace files are designed to be committed directly to Git alongside your tests. Before any node is written to disk, chronostrace-scrub
-automatically runs a two-stage redaction pipeline:
+Options verified from `--help`:
 
-   1. Pattern & Key Redaction: Strips Authorization headers, api_key / secret / password JSON fields, OpenAI/Anthropic sk-* keys,
-      GitHub ghp_* tokens, and AWS AKIA* credentials.
+- `--cassette <CASSETTE>` (required)
+- `--mode <MODE>` (`record`, `replay`, `passthrough`; default: `replay`)
+- `--similarity-threshold <THRESHOLD>` (default: `0.85`)
+- `--simulate-latency`
+- `--chaos-service-outage-prob <PROB>`
+- Child command after `--`
 
-   2. Shannon Entropy Filter: Scans contiguous tokens (>= 32 chars) and redacts any unlabelled token exceeding 4.35 bits/char of Shannon
-      entropy as [REDACTED_HIGH_ENTROPY_SECRET].
+On replay, a miss returns a JSON-RPC error with code `-32004`.
 
+### `diff`
 
-🤝 Contributing & Repository Layout
-chronostrace/
-├── crates/
-│   ├── chronostrace-core/     # DAG state machine, 64-bit FNV-1a SimHash, trajectory differ
-│   ├── chronostrace-scrub/    # Regex + Shannon entropy secret & PII redactor
-│   ├── chronostrace-chaos/    # Seeded Xorshift64* deterministic fault-injection engine
-│   ├── chronostrace-proxy/    # Tokio/Axum HTTP replay server & bidirectional MCP stdio wrapper
-│   └── chronostrace-cli/      # CLI entrypoint & ANSI/Markdown diff renderer
-├── sdks/
-│   ├── python/                # pytest-chronostrace plugin (built via maturin bin bindings)
-│   └── typescript/            # @chronostrace/test SDK for Vitest / Jest
-├── schemas/
-│   └── ctrace-v1.schema.json # Formal JSON Schema for .ctrace cassette files
-└── examples/
-    └── langgraph-refund-agent/# Multi-turn agent under HTTP 429 & MCP 503 chaos faults
+```bash
+chronostrace diff baseline.ctrace candidate.ctrace --format terminal
+chronostrace diff baseline.ctrace candidate.ctrace --format markdown
+chronostrace diff baseline.ctrace candidate.ctrace --format json
+```
 
-Run the full workspace verification suite locally:
+Options verified from `--help`:
 
+- `--format <FORMAT>` (`terminal`, `markdown`, `json`; default: `terminal`)
+- `--fail-on-divergence[=<true|false>]` (default: `true`)
+
+Exit codes:
+
+- `0`: compatible trajectory (`Identical` or `PromptDriftReconciled`
+  within threshold)
+- `1`: runtime or I/O error
+- `2`: breaking divergence (`ToolSchemaMutated`, `ToolArgumentMutated`,
+  `ResponseDiverged`, or `TopologyDiverged`)
+
+### `verify`
+
+```bash
+chronostrace verify --cassette cassette.ctrace
+```
+
+Loads a cassette, validates its DAG structure, and prints a summary
+including the cassette id, node count, similarity threshold, and whether
+it is marked scrubbed.
+
+## Three-tier matching
+
+When a request arrives during replay, ChronosTrace evaluates recorded DAG
+nodes in three stages:
+
+1. **Tier 1 — Exact canonical hash.** JSON object keys are sorted
+   recursively, whole-number floats are normalized, and volatile JSON-RPC
+   `id` fields are stripped before SHA-256 comparison at the active
+   parent node.
+2. **Tier 2 — Structural and safety-critical constraints.** The
+   interaction kind, tool schema/name (`structural_tool_hash`), and all
+   safety-critical values (`safety_critical_hash`, covering amounts,
+   numeric literals, IDs, URLs, paths, and SQL) must match exactly. For
+   `McpToolCall`, any tool argument change results in a replay miss.
+3. **Tier 3 — SimHash candidate retrieval.** For `LlmCompletion`, if Tier 2
+   passes, a 64-bit FNV-1a 3-word shingle SimHash is computed over the
+   prompt text. If similarity meets the cassette
+   `metadata.similarity_threshold`, the recorded response is replayed;
+   otherwise ChronosTrace returns an explicit replay miss (HTTP `412` or
+   JSON-RPC `-32004`).
+
+See [`docs/architecture.md`](./docs/architecture.md) and
+[`docs/cassette-format.md`](./docs/cassette-format.md) for details.
+
+## Chaos fault injection
+
+All fault profiles in `chronostrace-chaos` are driven by a seeded
+Xorshift64* generator with probability clamped to `[0.0, 1.0]`:
+
+| Fault variant | Behavior |
+|---|---|
+| `Http429RateLimit { retry_after_secs }` | HTTP `429` with a `Retry-After` header |
+| `ServiceUnavailable503` | HTTP `503`, or an MCP `isError: true` tool response frame |
+| `LatencySpike { delay_ms }` | Delay before returning the payload |
+| `TruncatedJsonPayload { keep_ratio }` | Truncate JSON output at `keep_ratio`, clamped to `[0.1, 0.9]`, at a UTF-8 boundary |
+| `DropSchemaField { field_name }` | Recursively remove `field_name` from the response JSON tree |
+
+The HTTP replay path exposes rate-limit chaos via
+`--chaos-rate-limit-prob`, and the MCP stdio path exposes outage chaos
+via `--chaos-service-outage-prob`.
+
+## Secret scrubbing
+
+`chronostrace-scrub` redacts, before a cassette is written:
+
+- sensitive field names (for example API keys, authorization, cookies,
+  secrets, passwords, and tokens),
+- key patterns (including `sk-` and `gh[pousr]_` style tokens),
+- authorization headers and PEM blocks,
+- tokens of at least 32 characters whose Shannon entropy is at least
+  `4.25` bits per character (HTTP(S) URLs excluded).
+
+Scrubber policy version `1.1.0-entropy-regex` and the redaction count are
+recorded in cassette metadata. Cassettes are marked `scrubbed` only after
+scrubbing is applied.
+
+Residual risk, documented in
+[`SECURITY_THREAT_MODEL.md`](./SECURITY_THREAT_MODEL.md): regex plus
+entropy filtering cannot guarantee finding short, low-entropy secrets.
+Use test-only credentials when recording.
+
+## Cassette format
+
+Cassettes are `.ctrace` files (version `1.0`) validated against
+[`schemas/ctrace-v1.schema.json`](./schemas/ctrace-v1.schema.json). Each
+cassette has an id, metadata (`created_at`, `similarity_threshold`,
+`scrubbed`, `scrubber_policy_version`, `redaction_count`), and an ordered
+list of DAG nodes linked by `parent_id`. Nodes carry the exact request
+hash, prompt SimHash, structural tool hash, request and response
+payloads, and recorded latency.
+
+Writes are atomic (temporary file, sync, rename) and DAG validation
+rejects duplicate nodes, missing parents, self-parents, and cycles.
+
+## SDKs
+
+### Python (`pytest-chronostrace`)
+
+The plugin lives at `sdks/python/pytest_chronostrace/plugin.py`. Tests
+marked with `@pytest.mark.chronostrace(<cassette>)` get a local replay
+daemon started automatically, with readiness polling (not a fixed sleep),
+early-exit detection, and safe child cleanup. The plugin sets, scoped to
+each test:
+
+- `OPENAI_BASE_URL` → `<daemon>/v1`
+- `ANTHROPIC_BASE_URL` → `<daemon>`
+- `CHRONOSTRACE_MCP_PROXY` → `<daemon>/mcp/call`
+
+The marker also accepts `chaos_rate_limit_prob` to inject HTTP 429 faults
+during the test.
+
+### TypeScript (`@chronostrace/test`)
+
+The SDK lives at `sdks/typescript/src/index.ts` and provides:
+
+- `withChronosTrace(options, fn)` — spawns the replay daemon on an
+  ephemeral port, waits for readiness, and tears it down (SIGTERM, then
+  SIGKILL after 1 second). It mutates `process.env` only when
+  `injectEnv: true` is passed.
+- `McpStdioTestClient` — a JSON-RPC 2.0 stdio client over
+  `chronostrace mcp-wrap`, with per-request timeouts.
+- `diffCassettes(baseline, candidate)` — runs `chronostrace diff
+  --format json` and returns compatibility plus the structured report.
+- `CassetteBuilder` — builds `.ctrace` cassettes programmatically with
+  canonical hashes and SimHashes matching the Rust core.
+- `canonicalizeJson`, `sha256CanonicalJson`, `computeSimHashHex` —
+  TypeScript ports aligned with the Rust implementations.
+
+The TypeScript end-to-end suite at
+`sdks/typescript/tests/chronostrace.e2e.test.ts` covers deterministic
+replay, SimHash-tolerant prompt edits, HTTP 429 recovery with backoff,
+MCP 503 circuit breaking, and argument-mutation detection via diff.
+
+## Compatibility
+
+See [`docs/compatibility.md`](./docs/compatibility.md):
+
+- Rust MSRV: 1.78+ (Edition 2021)
+- Python SDK: Python 3.10, 3.11, 3.12
+- TypeScript SDK: Node.js 20.x, 22.x
+- Operating systems: Linux (`x86_64`, `aarch64`), macOS (`x86_64`,
+  `aarch64`), Windows (`x86_64`)
+
+Continuous integration (`.github/workflows/ci.yml`) runs on push and pull
+request to branches `master` and `main`, covering formatting, Clippy,
+workspace tests, and both SDK suites.
+
+## Development and verification
+
+From the repository root:
+
+```bash
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+cargo build --release --package chronostrace-cli
+python3 -m py_compile sdks/python/pytest_chronostrace/plugin.py
+```
 
+From `sdks/typescript`, with the release binary available:
 
-📄 License
-Licensed under the Apache License, Version 2.0 (LICENSE).
+```bash
+export CHRONOSTRACE_BIN_PATH="$(pwd)/../../target/release/chronostrace"
+npm install
+npm run typecheck
+npm test
+```
 
+See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the full checklist and
+engineering rules.
 
-<ElicitationsGroup message="Next steps for ChronosTrace or the Project Genesis portfolio:">
-  <Elicitation label="Add selective live re-recording for diverged DAG branches" query="Implement `--record-on-miss`
-  <Elicitation label="Create a reusable GitHub Action for PR trajectory diff comments" query="Create a reusable GitH
-  <Elicitation label="Initiate Phase 9 build for Candidate #2 (AegisMCP)" query="Approve Candidate #2 (`AegisMCP`) f
-</ElicitationsGroup>
+## Further reading
 
+- [`AUDIT_FINDINGS.md`](./AUDIT_FINDINGS.md) — findings CT-001 to CT-016
+  and their implementation status
+- [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)
+- [`SECURITY_THREAT_MODEL.md`](./SECURITY_THREAT_MODEL.md)
+- [`CHANGELOG.md`](./CHANGELOG.md)
 
+## License
 
-User prompt: Now make a full file .Zip ready to download i want push on github
-
-Response: Here is the complete, production-ready source tree structure and file contents for the ChronosTrace repository, fully prepared to be
-zipped, pushed to GitHub, and published across Cargo, PyPI, and npm.
-
-Directory Tree Structure (chronostrace/)
-
-chronostrace/
-├── Cargo.toml
-├── LICENSE
-├── README.md
-├── schemas/
-│   └── ctrace-v1.schema.json
-├── .github/
-│   └── workflows/
-│       ├── ci.yml
-│       └── release.yml
-├── crates/
-│   ├── chronostrace-core/
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │        ├── lib.rs
-│   │        ├── simhash.rs
-│   │        └── diff.rs
-│   ├── chronostrace-scrub/
-│   │   ├── Cargo.toml
-│   │   └── src/
-
-
-
-
-
-│   │       └── lib.rs
-│   ├── chronostrace-chaos/
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       └── lib.rs
-│   ├── chronostrace-proxy/
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       └── mcp_stdio.rs
-│   └── chronostrace-cli/
-│       ├── Cargo.toml
-│       └── src/
-│           ├── main.rs
-│           └── diff_render.rs
-├── sdks/
-│   ├── python/
-│   │   ├── pyproject.toml
-│   │   └── pytest_chronostrace/
-│   │       └── plugin.py
-│   └── typescript/
-│       ├── package.json
-│       ├── tsconfig.json
-│       ├── src/
-│       │   ├── index.ts
-│       │   └── bin-path.ts
-│       └── tests/
-│           └── chronostrace.e2e.test.ts
-└── examples/
-    └── langgraph-refund-agent/
-        └── src/
-            └── agent.ts
+Licensed under the Apache License, Version 2.0 ([LICENSE](./LICENSE)).

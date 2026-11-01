@@ -1,54 +1,51 @@
 {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "https://chronostrace.dev/schemas/ctrace-v1.schema.json",
-    "title": "ChronosTrace Cassette v1",
-    "type": "object",
-    "required": ["version", "cassette_id", "metadata", "nodes"],
-    "properties": {
-      "version": { "type": "string", "const": "1.0" },
-      "cassette_id": { "type": "string" },
-      "metadata": {
-         "type": "object",
-         "required": ["created_at", "similarity_threshold", "scrubbed"],
-         "properties": {
-           "created_at": { "type": "string", "format": "date-time" },
-           "similarity_threshold": { "type": "number", "minimum": 0.5, "maximum": 1.0 },
-           "scrubbed": { "type": "boolean", "const": true }
-         }
-      },
-      "nodes": {
-         "type": "array",
-         "items": {
-           "type": "object",
-           "required": [
-              "node_id",
-              "parent_id",
-              "kind",
-              "exact_request_hash",
-              "prompt_simhash",
-              "structural_ tool_hash",
-              "request_payload",
-              "response_payload",
-              "recorded_latency_ms"
-           ],
-           "properties": {
-              "node_id": { "type": "string" },
-              "parent_id": { "type": ["string", "null"] },
-              "kind": { "type": "string", "enum": ["LlmCompletion", "McpToolCall", "HttpToolCall"] },
-              "exact_request_hash": { "type": "string" },
-              "prompt_simhash": { "type": "string", "pattern": "^[0-9a-fA-F]{16}$" },
-              "structural_tool_hash": { "type": "string" },
-              "request_payload": { "type": "object" },
-              "response_payload": { "type": "object" },
-              "recorded_latency_ms": { "type": "integer", "minimum": 0 }
-           }
-         }
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/AHMADYAZIDALFARISI/project-genesis/schemas/ctrace-v1.schema.json",
+  "title": "ChronosTrace Cassette v1",
+  "type": "object",
+  "required": ["version", "cassette_id", "metadata", "nodes"],
+  "properties": {
+    "version": { "type": "string", "const": "1.0" },
+    "cassette_id": { "type": "string", "minLength": 1 },
+    "metadata": {
+      "type": "object",
+      "required": ["created_at", "similarity_threshold", "scrubbed"],
+      "properties": {
+        "created_at": { "type": "string", "format": "date-time" },
+        "similarity_threshold": { "type": "number", "minimum": 0.5, "maximum": 1.0 },
+        "scrubbed": { "type": "boolean" },
+        "scrubber_policy_version": { "type": "string" },
+        "redaction_count": { "type": "integer", "minimum": 0 }
       }
-
-
-
-
-
-
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "parent_id",
+          "kind",
+          "exact_request_hash",
+          "prompt_simhash",
+          "structural_tool_hash",
+          "request_payload",
+          "response_payload",
+          "recorded_latency_ms"
+        ],
+        "properties": {
+          "node_id": { "type": "string", "minLength": 1 },
+          "parent_id": { "type": ["string", "null"] },
+          "kind": { "type": "string", "enum": ["LlmCompletion", "McpToolCall", "HttpToolCall"] },
+          "exact_request_hash": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+          "prompt_simhash": { "type": "string", "pattern": "^[0-9a-fA-F]{16}$" },
+          "structural_tool_hash": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+          "safety_critical_hash": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+          "request_payload": { "type": "object" },
+          "response_payload": { "type": "object" },
+          "recorded_latency_ms": { "type": "integer", "minimum": 0 }
+        }
+      }
     }
+  }
 }

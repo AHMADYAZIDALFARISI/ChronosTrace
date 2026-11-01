@@ -3,11 +3,16 @@ name = "chronostrace-cli"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "chronostrace"
+path = "src/main.rs"
+
 [dependencies]
 chronostrace-core = { path = "../chronostrace-core" }
 chronostrace-scrub = { path = "../chronostrace-scrub" }
 chronostrace-chaos = { path = "../chronostrace-chaos" }
 chronostrace-proxy = { path = "../chronostrace-proxy" }
+axum.workspace = true
 clap.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
