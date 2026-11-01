@@ -3,7 +3,7 @@
 Deterministic VCR replay, graph-aware trajectory diffing, and chaos fault
 injection for LLM and MCP workflows.
 
-[![CI](https://github.com/AHMADYAZIDALFARISI/project-genesis/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/AHMADYAZIDALFARISI/project-genesis/actions)
+[![CI](https://github.com/AHMADYAZIDALFARISI/ChronosTrace/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/AHMADYAZIDALFARISI/ChronosTrace/actions)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 
 ChronosTrace records multi-turn LLM and Model Context Protocol (MCP) tool
@@ -11,7 +11,7 @@ trajectories into content-addressed `.ctrace` cassettes and replays them
 deterministically offline. It is written in Rust, with a Python `pytest`
 plugin and a TypeScript SDK for Vitest.
 
-Repository: https://github.com/AHMADYAZIDALFARISI/project-genesis
+Repository: https://github.com/AHMADYAZIDALFARISI/ChronosTrace
 Default branch: `master`
 Version: `0.1.0`
 
@@ -62,8 +62,8 @@ chronostrace/
 ## Building the CLI
 
 ```bash
-git clone https://github.com/AHMADYAZIDALFARISI/project-genesis.git
-cd project-genesis
+git clone https://github.com/AHMADYAZIDALFARISI/ChronosTrace.git
+cd ChronosTrace
 cargo build --release --package chronostrace-cli
 ./target/release/chronostrace --version
 ```

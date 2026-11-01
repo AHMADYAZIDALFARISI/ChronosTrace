@@ -11,7 +11,7 @@
 Please do **not** report security vulnerabilities through public GitHub
 issues. Instead, report them privately via GitHub Security Advisories:
 
-https://github.com/AHMADYAZIDALFARISI/project-genesis/security/advisories
+https://github.com/AHMADYAZIDALFARISI/ChronosTrace/security/advisories
 
 Include, where possible:
 
