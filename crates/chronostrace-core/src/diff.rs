@@ -26,6 +26,12 @@ pub struct FieldDelta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepDiff {
     pub step_index: usize,
+    /// Occurrence index of this step among steps with the same
+    /// kind, target, and parent in its own cassette (CT-DIFF-01).
+    /// 0 for the first occurrence. Defaults to 0 when reading
+    /// reports produced before this field existed.
+    #[serde(default)]
+    pub occurrence_index: usize,
     pub baseline_node_id: Option<String>,
     pub candidate_node_id: Option<String>,
     pub interaction_kind: InteractionKind,
@@ -60,6 +66,65 @@ impl TrajectoryDiffReport {
             && self.response_diverged_count == 0
             && self.topology_diverged_count == 0
     }
+
+    /// Worst severity across steps (CT-DIFF-02).
+    pub fn max_severity(&self) -> DiffSeverity {
+        self.steps
+            .iter()
+            .map(|s| s.kind.severity())
+            .max()
+            .unwrap_or(DiffSeverity::Informational)
+    }
+
+    /// CI exit code for the report (CT-DIFF-02): 0 clean,
+    /// 2 behavioral divergence, 3 critical divergence.
+    pub fn ci_exit_code(&self) -> i32 {
+        self.max_severity().ci_exit_code()
+    }
+}
+
+/// Semantic severity of one diff step (CT-DIFF-02). Ordered so
+/// `max()` yields the worst step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum DiffSeverity {
+    Informational,
+    Behavioral,
+    Critical,
+}
+
+impl DiffSeverity {
+    pub fn ci_exit_code(&self) -> i32 {
+        match self {
+            DiffSeverity::Informational => 0,
+            DiffSeverity::Behavioral => 2,
+            DiffSeverity::Critical => 3,
+        }
+    }
+}
+
+impl DiffKind {
+    pub fn severity(&self) -> DiffSeverity {
+        match self {
+            DiffKind::Identical | DiffKind::PromptDriftReconciled => DiffSeverity::Informational,
+            DiffKind::ResponseDiverged => DiffSeverity::Behavioral,
+            DiffKind::ToolSchemaMutated
+            | DiffKind::ToolArgumentMutated
+            | DiffKind::TopologyDiverged => DiffSeverity::Critical,
+        }
+    }
+}
+
+/// Stable identity for one aligned step (CT-DIFF-01). The
+/// occurrence index counts previous steps with the same kind,
+/// target, and parent inside the same cassette, so repeated calls
+/// to the same target are distinguishable instead of collapsing
+/// onto the first match.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeAlignmentKey {
+    pub parent_id: Option<String>,
+    pub kind: String,
+    pub target_name: String,
+    pub occurrence_index: usize,
 }
 
 pub fn diff_cassettes(baseline: &Cassette, candidate: &Cassette) -> TrajectoryDiffReport {
@@ -90,8 +155,21 @@ pub fn diff_cassettes(baseline: &Cassette, candidate: &Cassette) -> TrajectoryDi
     let candidate_total_latency_ms: u64 =
         candidate.nodes.iter().map(|n| n.recorded_latency_ms).sum();
 
+    // Occurrence counts per (kind, target, parent) within each
+    // cassette (CT-DIFF-01): repeated calls to the same target
+    // get distinct, stable indices instead of sharing one.
+    let mut baseline_occurrences: HashMap<(String, String, Option<String>), usize> = HashMap::new();
+    let mut candidate_occurrences: HashMap<(String, String, Option<String>), usize> =
+        HashMap::new();
     for (b_idx, base) in baseline.nodes.iter().enumerate() {
         let base_target = extract_target_name(&base.request_payload);
+        let base_occ_key = (
+            format!("{:?}", base.kind),
+            base_target.clone(),
+            base.parent_id.clone(),
+        );
+        let base_occurrence = *baseline_occurrences.get(&base_occ_key).unwrap_or(&0);
+        baseline_occurrences.insert(base_occ_key, base_occurrence + 1);
 
         // Graph-aware alignment: a candidate matches only when it has the
         // same kind and target AND its parent is the matched counterpart of
@@ -126,7 +204,7 @@ pub fn diff_cassettes(baseline: &Cassette, candidate: &Cassette) -> TrajectoryDi
             matched_cand_indices.insert(c_idx);
             base_to_cand.insert(b_idx, c_idx);
             let cand = &candidate.nodes[c_idx];
-            let step = compare_node_pair(steps.len(), base, cand, threshold);
+            let step = compare_node_pair(steps.len(), base_occurrence, base, cand, threshold);
             match step.kind {
                 DiffKind::Identical => identical_count += 1,
                 DiffKind::PromptDriftReconciled => reconciled_drift_count += 1,
@@ -141,6 +219,7 @@ pub fn diff_cassettes(baseline: &Cassette, candidate: &Cassette) -> TrajectoryDi
             topology_diverged_count += 1;
             steps.push(StepDiff {
                 step_index: steps.len(),
+                occurrence_index: base_occurrence,
                 baseline_node_id: Some(base.node_id.clone()),
                 candidate_node_id: None,
                 interaction_kind: base.kind.clone(),
@@ -157,9 +236,18 @@ pub fn diff_cassettes(baseline: &Cassette, candidate: &Cassette) -> TrajectoryDi
 
     for (c_idx, cand) in candidate.nodes.iter().enumerate() {
         if !matched_cand_indices.contains(&c_idx) {
+            let cand_target = extract_target_name(&cand.request_payload);
+            let cand_occ_key = (
+                format!("{:?}", cand.kind),
+                cand_target.clone(),
+                cand.parent_id.clone(),
+            );
+            let cand_occurrence = *candidate_occurrences.get(&cand_occ_key).unwrap_or(&0);
+            candidate_occurrences.insert(cand_occ_key, cand_occurrence + 1);
             topology_diverged_count += 1;
             steps.push(StepDiff {
                 step_index: steps.len(),
+                occurrence_index: cand_occurrence,
                 baseline_node_id: None,
                 candidate_node_id: Some(cand.node_id.clone()),
                 interaction_kind: cand.kind.clone(),
@@ -192,6 +280,7 @@ pub fn diff_cassettes(baseline: &Cassette, candidate: &Cassette) -> TrajectoryDi
 
 fn compare_node_pair(
     step_index: usize,
+    occurrence_index: usize,
     base: &TraceNode,
     cand: &TraceNode,
     threshold: f64,
@@ -254,6 +343,7 @@ fn compare_node_pair(
 
     StepDiff {
         step_index,
+        occurrence_index,
         baseline_node_id: Some(base.node_id.clone()),
         candidate_node_id: Some(cand.node_id.clone()),
         interaction_kind: cand.kind.clone(),
@@ -626,5 +716,74 @@ mod tests {
         assert!(report.steps[2].candidate_node_id.is_none());
         assert_eq!(report.topology_diverged_count, 4);
         assert!(!report.is_compatible());
+    }
+
+    // CT-DIFF-01/02: repeated calls to the same target carry
+    // distinct occurrence indices, and the report maps its worst
+    // step to a CI exit code.
+    #[test]
+    fn repeated_targets_get_occurrence_indices_and_ci_exit_codes() {
+        fn build_pair() -> (Cassette, Cassette) {
+            let mut baseline = Cassette::new("occ_base", 0.80);
+            let mut candidate = Cassette::new("occ_cand", 0.80);
+            let tools = json!([{"name": "charge"}]);
+            let req = json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "charge", "arguments": {"amount": 10}}
+            });
+            let resp = json!({"charged": true});
+            for _ in 0..2 {
+                baseline.record_node(
+                    None,
+                    InteractionKind::McpToolCall,
+                    "charge",
+                    &tools,
+                    req.clone(),
+                    resp.clone(),
+                    5,
+                );
+                candidate.record_node(
+                    None,
+                    InteractionKind::McpToolCall,
+                    "charge",
+                    &tools,
+                    req.clone(),
+                    resp.clone(),
+                    5,
+                );
+            }
+            (baseline, candidate)
+        }
+
+        let (baseline, candidate) = build_pair();
+        let report = diff_cassettes(&baseline, &candidate);
+        assert_eq!(report.steps.len(), 2);
+        assert_eq!(report.steps[0].occurrence_index, 0);
+        assert_eq!(report.steps[1].occurrence_index, 1);
+        assert_eq!(report.steps[0].kind, DiffKind::Identical);
+        assert_eq!(report.steps[1].kind, DiffKind::Identical);
+        assert_eq!(report.max_severity(), DiffSeverity::Informational);
+        assert_eq!(report.ci_exit_code(), 0);
+
+        // Same args, different response on the second call:
+        // behavioral divergence, exit code 2.
+        let (baseline, mut candidate) = build_pair();
+        candidate.nodes[1].response_payload = json!({"charged": false});
+        let report = diff_cassettes(&baseline, &candidate);
+        assert_eq!(report.steps[1].kind, DiffKind::ResponseDiverged);
+        assert_eq!(report.max_severity(), DiffSeverity::Behavioral);
+        assert_eq!(report.ci_exit_code(), 2);
+
+        // Missing second call: topology divergence, exit code 3.
+        let (baseline, mut candidate) = build_pair();
+        candidate.nodes.pop();
+        let report = diff_cassettes(&baseline, &candidate);
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| s.kind == DiffKind::TopologyDiverged));
+        assert_eq!(report.max_severity(), DiffSeverity::Critical);
+        assert_eq!(report.ci_exit_code(), 3);
     }
 }

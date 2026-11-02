@@ -123,6 +123,27 @@ pub enum MatchResult<'a> {
     },
 }
 
+/// Resource bounds for DAG validation (CT-CORE-04). Validation
+/// previously checked shape (duplicates, missing/self parents,
+/// cycles) but placed no bound on size or depth, so a hostile or
+/// corrupt cassette could force unbounded walks and memory use.
+/// Defaults are generous for real trajectories and only reject
+/// pathological graphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DagLimits {
+    pub max_nodes: usize,
+    pub max_depth: usize,
+}
+
+impl Default for DagLimits {
+    fn default() -> Self {
+        Self {
+            max_nodes: 100_000,
+            max_depth: 2_048,
+        }
+    }
+}
+
 impl Cassette {
     pub fn new(cassette_id: impl Into<String>, similarity_threshold: f64) -> Self {
         let clamped_threshold = similarity_threshold.clamp(0.5, 1.0);
@@ -183,6 +204,24 @@ impl Cassette {
             file.write_all(yaml.as_bytes())?;
             file.sync_all()?;
             fs::rename(&tmp_path, target_path)?;
+            // CT-CORE-05: file sync alone does not durably record the
+            // rename itself. Best-effort directory sync on Unix closes
+            // that gap; failure here is non-fatal (the rename already
+            // happened) and must not turn a successful save into an
+            // error. Concurrent writers to the same target remain
+            // last-writer-wins at the rename — documented, not fixed,
+            // because cross-process file locking would change the
+            // single-writer contract the proxy already enforces.
+            #[cfg(unix)]
+            {
+                if let Some(parent) = target_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        if let Ok(dir) = File::open(parent) {
+                            let _ = dir.sync_all();
+                        }
+                    }
+                }
+            }
             Ok(())
         })();
         if write_result.is_err() {
@@ -192,6 +231,64 @@ impl Cassette {
     }
 
     pub fn validate_dag(&self) -> Result<(), TraceError> {
+        self.validate_dag_with_limits(&DagLimits::default())
+    }
+
+    /// Shape validation plus resource bounds (CT-CORE-04).
+    pub fn validate_dag_with_limits(&self, limits: &DagLimits) -> Result<(), TraceError> {
+        if self.nodes.len() > limits.max_nodes {
+            return Err(TraceError::InvalidDag(format!(
+                "Node count {} exceeds limit {}",
+                self.nodes.len(),
+                limits.max_nodes
+            )));
+        }
+        self.validate_dag_shape()?;
+        // Depth pass: safe now that the shape pass proved acyclicity.
+        // Depth is memoized per node, so the pass stays O(n).
+        let parent_of: HashMap<&str, Option<&str>> = self
+            .nodes
+            .iter()
+            .map(|n| (n.node_id.as_str(), n.parent_id.as_deref()))
+            .collect();
+        let mut depths: HashMap<&str, usize> = HashMap::new();
+        for node in &self.nodes {
+            let mut chain: Vec<&str> = Vec::new();
+            let mut current = Some(node.node_id.as_str());
+            while let Some(id) = current {
+                if let Some(&d) = depths.get(id) {
+                    let mut depth = d;
+                    for id_in_chain in chain.iter().rev() {
+                        depth += 1;
+                        depths.insert(id_in_chain, depth);
+                    }
+                    break;
+                }
+                chain.push(id);
+                current = parent_of.get(id).copied().flatten();
+            }
+            if !depths.contains_key(node.node_id.as_str()) {
+                // Chain reached a root without hitting a memoized node:
+                // depths grow from the root (depth 1) outward.
+                let mut depth = 0;
+                for id_in_chain in chain.iter().rev() {
+                    depth += 1;
+                    depths.insert(id_in_chain, depth);
+                }
+            }
+            if depths[node.node_id.as_str()] > limits.max_depth {
+                return Err(TraceError::InvalidDag(format!(
+                    "Node {} depth {} exceeds limit {}",
+                    node.node_id,
+                    depths[node.node_id.as_str()],
+                    limits.max_depth
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_dag_shape(&self) -> Result<(), TraceError> {
         let mut seen_ids = HashSet::new();
         for node in &self.nodes {
             if !seen_ids.insert(node.node_id.as_str()) {
@@ -330,8 +427,24 @@ impl Cassette {
 
         if *kind == InteractionKind::McpToolCall {
             let tool_hash = sha256_canonical_json(structural_tool_payload);
+            // CT-CORE-01: the structural fallback must never bypass
+            // argument identity. A tool call whose safety-critical
+            // fields differ (amount, user_id, order_id, ...) must NOT
+            // replay an earlier response, even when the tool schema
+            // matches. The fallback therefore requires the incoming
+            // safety-critical hash to equal the recorded one; anything
+            // else is a replay miss. Non-critical differences may
+            // still match structurally, as before.
+            let incoming_safety = compute_safety_critical_hash(request_payload);
             if let Some(mcp_node) = self.nodes.iter().find(|n| {
-                &n.parent_id == parent_id && &n.kind == kind && n.structural_tool_hash == tool_hash
+                &n.parent_id == parent_id
+                    && &n.kind == kind
+                    && n.structural_tool_hash == tool_hash
+                    && (if n.safety_critical_hash.is_empty() {
+                        compute_safety_critical_hash(&n.request_payload)
+                    } else {
+                        n.safety_critical_hash.clone()
+                    }) == incoming_safety
             }) {
                 return Ok(MatchResult::Exact(mcp_node));
             }
@@ -362,7 +475,14 @@ impl Cassette {
             {
                 let recorded_simhash = u64::from_str_radix(&node.prompt_simhash, 16).unwrap_or(0);
                 let score = simhash_similarity(incoming_simhash, recorded_simhash);
-                if best_candidate.is_none_or(|(_, best)| score > best) {
+                // CT-BUILD-01: Option::is_none_or stabilized in Rust
+                // 1.82, after the declared MSRV 1.78. Written out
+                // explicitly so the crate still builds on 1.78.
+                let is_better = match best_candidate {
+                    None => true,
+                    Some((_, best)) => score > best,
+                };
+                if is_better {
                     best_candidate = Some((node, score));
                 }
             }
@@ -714,5 +834,104 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // CT-CORE-01: before the fix, the MCP structural fallback
+    // returned Exact for any arguments sharing the tool schema, so
+    // amount=50 could replay the response recorded for amount=500
+    // (and vice versa). The fallback now requires the
+    // safety-critical hash to match.
+    #[test]
+    fn mcp_structural_fallback_blocks_safety_critical_argument_change() {
+        let mut cassette = Cassette::new("mcp_safety_cassette", 0.80);
+        let tools = json!([{"name": "issue_refund"}]);
+        let req_base = json!({
+            "tool": "issue_refund",
+            "arguments": {"amount": 50, "currency": "USD", "dry_run": true}
+        });
+        let resp = json!({"refunded": true});
+        cassette.record_node(
+            None,
+            InteractionKind::McpToolCall,
+            "refund",
+            &tools,
+            req_base.clone(),
+            resp,
+            1,
+        );
+
+        // Critical change: amount 50 -> 500 must MISS, not replay.
+        let req_changed = json!({
+            "tool": "issue_refund",
+            "arguments": {"amount": 500, "currency": "USD", "dry_run": true}
+        });
+        let res = cassette.match_request(
+            &None,
+            &InteractionKind::McpToolCall,
+            "refund",
+            &tools,
+            &req_changed,
+        );
+        assert!(res.is_err(), "critical amount change must not replay");
+
+        // Non-critical change: booleans are not part of the
+        // safety hash (only critical fields, strings, and numbers
+        // are), so toggling one may still match structurally, as
+        // before. Numbers and strings are safety-relevant here by
+        // design, so they are deliberately not used as the benign
+        // control.
+        let req_benign = json!({
+            "tool": "issue_refund",
+            "arguments": {"amount": 50, "currency": "USD", "dry_run": false}
+        });
+        let res = cassette.match_request(
+            &None,
+            &InteractionKind::McpToolCall,
+            "refund",
+            &tools,
+            &req_benign,
+        );
+        assert!(
+            matches!(res, Ok(MatchResult::Exact(_))),
+            "non-critical boolean change keeps structural fallback"
+        );
+    }
+
+    // CT-CORE-04: DAG validation now enforces resource bounds.
+    #[test]
+    fn validate_dag_enforces_node_count_and_depth_limits() {
+        let mut cassette = Cassette::new("limits_cassette", 0.80);
+        let tools = json!([{"name": "noop"}]);
+        let req = json!({"tools": tools});
+        let resp = json!({"ok": true});
+        let mut parent = None;
+        for i in 0..5 {
+            parent = Some(cassette.record_node(
+                parent,
+                InteractionKind::McpToolCall,
+                "step",
+                &tools,
+                req.clone(),
+                resp.clone(),
+                1,
+            ));
+            let _ = i;
+        }
+        assert!(cassette.validate_dag().is_ok());
+        let err = cassette
+            .validate_dag_with_limits(&DagLimits {
+                max_nodes: 3,
+                max_depth: 2_048,
+            })
+            .expect_err("5 nodes must exceed a max_nodes of 3");
+        assert!(matches!(err, TraceError::InvalidDag(_)));
+        // The chain is 5 deep, so a max_depth of 2 must also fail.
+        let err = cassette
+            .validate_dag_with_limits(&DagLimits {
+                max_nodes: 100_000,
+                max_depth: 2,
+            })
+            .expect_err("depth 5 must exceed a max_depth of 2");
+        assert!(matches!(err, TraceError::InvalidDag(_)));
     }
 }

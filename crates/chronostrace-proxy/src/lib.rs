@@ -54,6 +54,21 @@ impl UpstreamTarget {
     }
 }
 
+/// Maximum distinct sessions a proxy keeps (CT-RUN-02). The
+/// session map previously grew without bound: every distinct
+/// `X-ChronosTrace-Session` value allocated an entry (and a
+/// session lock) that was never removed, so an unbounded stream
+/// of header values was an unbounded memory growth vector. A new
+/// session past this cap is rejected with 429; existing sessions
+/// keep working. No TTL eviction: sessions are cheap pointers,
+/// and silently expiring one would corrupt an in-flight replay
+/// chain, which is worse than an explicit rejection.
+pub const MAX_SESSIONS: usize = 1_024;
+/// Session keys longer than this are ignored (treated as no
+/// session), so a single oversized header cannot become a
+/// large map key either.
+pub const MAX_SESSION_KEY_LEN: usize = 256;
+
 pub struct ProxyState {
     pub cassette: Cassette,
     pub current_parent_id: Option<String>,
@@ -127,7 +142,7 @@ fn session_key(headers: &HeaderMap) -> Option<String> {
         .get("x-chronostrace-session")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && s.len() <= MAX_SESSION_KEY_LEN)
         .map(str::to_string)
 }
 
@@ -139,6 +154,25 @@ async fn dispatch(
     payload: Value,
 ) -> Response {
     let session = session_key(&headers);
+    // CT-RUN-02 admission: reject a NEW session past the cap
+    // before it allocates a session entry or a session lock.
+    // Existing sessions are never rejected by this check.
+    if let Some(key) = &session {
+        let at_cap = {
+            let guard = state.lock().expect("ProxyState mutex poisoned");
+            !guard.sessions.contains_key(key) && guard.sessions.len() >= MAX_SESSIONS
+        };
+        if at_cap {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "CHRONOSTRACE_TOO_MANY_SESSIONS",
+                    "message": "Session limit reached; retry with an existing session id"
+                })),
+            )
+                .into_response();
+        }
+    }
     let forwarded_headers = collect_forwardable_headers(&headers);
     let is_record = state
         .lock()
@@ -984,6 +1018,66 @@ mod tests {
         assert_eq!(session_key(&headers).as_deref(), Some("session-a"));
         headers.insert("x-chronostrace-session", HeaderValue::from_static("   "));
         assert!(session_key(&headers).is_none());
+    }
+
+    // CT-RUN-02: overlong session keys are ignored, and a new
+    // session past the cap is rejected with 429 before it can
+    // allocate a session entry or lock. Existing sessions pass.
+    #[test]
+    fn session_key_rejects_overlong_keys() {
+        let mut headers = HeaderMap::new();
+        let long_key = "s".repeat(MAX_SESSION_KEY_LEN + 1);
+        headers.insert(
+            "x-chronostrace-session",
+            HeaderValue::from_str(&long_key).unwrap(),
+        );
+        assert!(session_key(&headers).is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_new_session_past_cap() {
+        let state = sample_proxy_state(None);
+        {
+            let mut guard = state.lock().unwrap();
+            for i in 0..MAX_SESSIONS {
+                guard.sessions.insert(format!("s{i}"), None);
+            }
+        }
+        // A brand-new session past the cap: 429, no allocation.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-chronostrace-session",
+            HeaderValue::from_static("brand-new-session"),
+        );
+        let (status, _, body) = response_json(
+            dispatch(
+                state.clone(),
+                InteractionKind::LlmCompletion,
+                "/v1/chat/completions",
+                headers,
+                json!({"model": "gpt-4o", "messages": []}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"], "CHRONOSTRACE_TOO_MANY_SESSIONS");
+        assert_eq!(state.lock().unwrap().sessions.len(), MAX_SESSIONS);
+        // An existing session is unaffected by the cap.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-chronostrace-session", HeaderValue::from_static("s0"));
+        let (status, _, _) = response_json(
+            dispatch(
+                state.clone(),
+                InteractionKind::LlmCompletion,
+                "/v1/chat/completions",
+                headers,
+                json!({"model": "gpt-4o", "messages": []}),
+            )
+            .await,
+        )
+        .await;
+        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

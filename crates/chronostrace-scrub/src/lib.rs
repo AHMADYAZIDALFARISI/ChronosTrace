@@ -1,9 +1,89 @@
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const SCRUBBER_POLICY_VERSION: &str = "1.2.0-entropy-regex-jwt";
+
+/// Proof that a payload passed through the scrubber before
+/// persistence (CT-SEC-02). The flag alone is not evidence; the
+/// policy version plus the hash of the stored bytes is what makes
+/// the claim checkable after the fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrubProof {
+    pub scrubbed: bool,
+    pub policy_version: String,
+    pub payload_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScrubError {
+    /// The scrubber's own second pass still changed the payload,
+    /// i.e. the first pass left something recognizable behind.
+    ResidualSecretDetected(String),
+    SerializationError(String),
+}
+
+impl std::fmt::Display for ScrubError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScrubError::ResidualSecretDetected(path) => write!(
+                f,
+                "Scrubbing verification failed: residual sensitive pattern detected at {path}"
+            ),
+            ScrubError::SerializationError(msg) => {
+                write!(f, "Serialization failed during scrub verification: {msg}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScrubError {}
+
+/// Fail-closed scrub for the persistence boundary (CT-SEC-01/02).
+/// Scrubs with the existing `SecretScrubber` (pattern, JWT, and
+/// entropy detection — deliberately reused, not reimplemented),
+/// then verifies by re-scrubbing: if the second pass changes
+/// anything, the first pass left a recognizable secret behind and
+/// the call FAILS instead of returning a payload to store. Callers
+/// must not persist the input when this returns `Err`.
+///
+/// Deviation from the audit payload's sketch, recorded honestly:
+/// the sketch proposed a new standalone detector under the name
+/// `scrub_json_value_EnteringPersistence` (non-snake-case, which
+/// would trip `clippy -D warnings`). This implementation keeps the
+/// behavior — scrub, verify, proof — under a snake-case name and
+/// on top of the existing detector, which is strictly stronger
+/// (entropy + JWT + custom patterns).
+pub fn scrub_json_for_persistence(input: &Value) -> Result<(Value, ScrubProof), ScrubError> {
+    let scrubber = SecretScrubber::new();
+    let scrubbed = scrubber.scrub_json(input);
+    let rescrubbed = scrubber.scrub_json(&scrubbed);
+    if rescrubbed != scrubbed {
+        return Err(ScrubError::ResidualSecretDetected(
+            "re-scrub changed the payload".to_string(),
+        ));
+    }
+    let serialized =
+        serde_json::to_vec(&scrubbed).map_err(|e| ScrubError::SerializationError(e.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&serialized);
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    Ok((
+        scrubbed,
+        ScrubProof {
+            scrubbed: true,
+            policy_version: SCRUBBER_POLICY_VERSION.to_string(),
+            payload_sha256: digest,
+        },
+    ))
+}
 
 pub struct SecretScrubber {
     patterns: Vec<(Regex, &'static str)>,
@@ -299,5 +379,30 @@ mod tests {
         let payload = json!({"note": "the code is abc123"});
         let scrubbed = scrubber.scrub_json(&payload);
         assert_eq!(scrubbed["note"], "the code is abc123");
+    }
+
+    // CT-SEC-01/02: the fail-closed persistence boundary redacts
+    // nested secrets and proves the stored bytes.
+    #[test]
+    fn persistence_scrub_redacts_nested_secrets_and_proves_hash() {
+        let payload = json!({
+            "auth": {"api_key": "sk-ant-api03-FAKEFAKEFAKEFAKE1234"},
+            "nested": {"token": "ghp_FAKEFAKEFAKEFAKEFAKEFAKE1234"},
+            "note": "plain text survives",
+        });
+        let (scrubbed, proof) = scrub_json_for_persistence(&payload).expect("must scrub clean");
+        let rendered = scrubbed.to_string();
+        assert!(!rendered.contains("FAKEFAKEFAKEFAKE"));
+        assert!(rendered.contains("plain text survives"));
+        assert!(proof.scrubbed);
+        assert_eq!(proof.policy_version, SCRUBBER_POLICY_VERSION);
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_vec(&scrubbed).unwrap());
+        let expected = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert_eq!(proof.payload_sha256, expected);
     }
 }

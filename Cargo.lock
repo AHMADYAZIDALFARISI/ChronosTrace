@@ -194,6 +194,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -248,7 +249,9 @@ name = "chronostrace-scrub"
 version = "0.1.0"
 dependencies = [
  "regex",
+ "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
