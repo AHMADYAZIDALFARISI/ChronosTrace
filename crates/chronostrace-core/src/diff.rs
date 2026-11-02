@@ -786,4 +786,147 @@ mod tests {
         assert_eq!(report.max_severity(), DiffSeverity::Critical);
         assert_eq!(report.ci_exit_code(), 3);
     }
+
+    // SECOND AUDIT P2: tool-schema mutation, added nodes, and
+    // branching children each classify deterministically.
+    #[test]
+    fn diff_tool_schema_mutation_is_critical() {
+        let mut baseline = Cassette::new("schema_base", 0.80);
+        let mut candidate = Cassette::new("schema_cand", 0.80);
+        let tools_v1 = json!([{"name": "verify_order"}]);
+        let tools_v2 = json!([{"name": "verify_order", "description": "v2"}]);
+        let resp = json!({"ok": true});
+        baseline.record_node(
+            None,
+            InteractionKind::LlmCompletion,
+            "verify",
+            &tools_v1,
+            json!({"model": "gpt-4o", "messages": [{"content": "verify"}], "tools": tools_v1}),
+            resp.clone(),
+            10,
+        );
+        candidate.record_node(
+            None,
+            InteractionKind::LlmCompletion,
+            "verify",
+            &tools_v2,
+            json!({"model": "gpt-4o", "messages": [{"content": "verify"}], "tools": tools_v2}),
+            resp,
+            10,
+        );
+        let report = diff_cassettes(&baseline, &candidate);
+        assert_eq!(report.steps[0].kind, DiffKind::ToolSchemaMutated);
+        assert_eq!(report.steps[0].kind.severity(), DiffSeverity::Critical);
+        assert_eq!(report.mutated_args_count, 1);
+        assert_eq!(report.ci_exit_code(), 3);
+    }
+
+    #[test]
+    fn diff_added_candidate_node_is_topology_diverged() {
+        let mut baseline = Cassette::new("add_base", 0.80);
+        let mut candidate = Cassette::new("add_cand", 0.80);
+        let tools = json!([{"name": "noop"}]);
+        let req = json!({"tools": tools});
+        let resp = json!({"ok": true});
+        baseline.record_node(
+            None,
+            InteractionKind::McpToolCall,
+            "one",
+            &tools,
+            req.clone(),
+            resp.clone(),
+            1,
+        );
+        candidate.record_node(
+            None,
+            InteractionKind::McpToolCall,
+            "one",
+            &tools,
+            req.clone(),
+            resp.clone(),
+            1,
+        );
+        candidate.record_node(
+            None,
+            InteractionKind::McpToolCall,
+            "two",
+            &tools,
+            req.clone(),
+            resp.clone(),
+            1,
+        );
+        let report = diff_cassettes(&baseline, &candidate);
+        assert_eq!(report.total_candidate_steps, 2);
+        let added = report
+            .steps
+            .iter()
+            .find(|s| s.baseline_node_id.is_none())
+            .expect("added node must appear as its own step");
+        assert_eq!(added.kind, DiffKind::TopologyDiverged);
+        assert_eq!(report.topology_diverged_count, 1);
+        assert!(!report.is_compatible());
+    }
+
+    #[test]
+    fn diff_branching_children_missing_child_diverges() {
+        let mut baseline = Cassette::new("branch_base", 0.80);
+        let mut candidate = Cassette::new("branch_cand", 0.80);
+        let tools = json!([{"name": "noop"}]);
+        let req = json!({"tools": tools});
+        let resp = json!({"ok": true});
+        let b_root = baseline.record_node(
+            None,
+            InteractionKind::McpToolCall,
+            "root",
+            &tools,
+            req.clone(),
+            resp.clone(),
+            1,
+        );
+        baseline.record_node(
+            Some(b_root.clone()),
+            InteractionKind::McpToolCall,
+            "left",
+            &tools,
+            req.clone(),
+            resp.clone(),
+            1,
+        );
+        baseline.record_node(
+            Some(b_root),
+            InteractionKind::McpToolCall,
+            "right",
+            &tools,
+            req.clone(),
+            resp.clone(),
+            1,
+        );
+        let c_root = candidate.record_node(
+            None,
+            InteractionKind::McpToolCall,
+            "root",
+            &tools,
+            req.clone(),
+            resp.clone(),
+            1,
+        );
+        candidate.record_node(
+            Some(c_root),
+            InteractionKind::McpToolCall,
+            "left",
+            &tools,
+            req.clone(),
+            resp.clone(),
+            1,
+        );
+        let report = diff_cassettes(&baseline, &candidate);
+        assert_eq!(report.identical_count, 2);
+        assert_eq!(report.topology_diverged_count, 1);
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| s.kind == DiffKind::TopologyDiverged
+                && s.baseline_node_id.is_some()
+                && s.candidate_node_id.is_none()));
+    }
 }

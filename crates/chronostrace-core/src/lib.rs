@@ -24,7 +24,9 @@ const SAFETY_CRITICAL_KEYS: &[&str] = &[
     "user_id",
     "account_id",
     "customer_id",
+    "transaction_id",
     "recipient",
+    "recipient_id",
     "role",
     "permission",
     "permissions",
@@ -426,25 +428,28 @@ impl Cassette {
         }
 
         if *kind == InteractionKind::McpToolCall {
+            // SECOND AUDIT P0: strict MCP matching. The structural
+            // fallback from the previous cycle still authorized
+            // replays for argument changes the safety hash does not
+            // see (booleans, added arguments, key renames). Now an
+            // MCP request matches ONLY when tool identity/schema AND
+            // the full arguments match. The structural hash is still
+            // required (tool identity + schema), but it is never
+            // sufficient on its own: the normalized argument hash
+            // must also match. Anything else is a replay miss —
+            // never silently converted into a successful replay.
+            // Normalization strips ONLY the volatile JSON-RPC
+            // envelope id (top-level "id" on a jsonrpc 2.0 message);
+            // business identifiers at any depth, including bare
+            // nested "id" fields, are part of the arguments.
             let tool_hash = sha256_canonical_json(structural_tool_payload);
-            // CT-CORE-01: the structural fallback must never bypass
-            // argument identity. A tool call whose safety-critical
-            // fields differ (amount, user_id, order_id, ...) must NOT
-            // replay an earlier response, even when the tool schema
-            // matches. The fallback therefore requires the incoming
-            // safety-critical hash to equal the recorded one; anything
-            // else is a replay miss. Non-critical differences may
-            // still match structurally, as before.
-            let incoming_safety = compute_safety_critical_hash(request_payload);
+            let incoming_args_hash = sha256_canonical_json(&strip_mcp_envelope_id(request_payload));
             if let Some(mcp_node) = self.nodes.iter().find(|n| {
                 &n.parent_id == parent_id
                     && &n.kind == kind
                     && n.structural_tool_hash == tool_hash
-                    && (if n.safety_critical_hash.is_empty() {
-                        compute_safety_critical_hash(&n.request_payload)
-                    } else {
-                        n.safety_critical_hash.clone()
-                    }) == incoming_safety
+                    && sha256_canonical_json(&strip_mcp_envelope_id(&n.request_payload))
+                        == incoming_args_hash
             }) {
                 return Ok(MatchResult::Exact(mcp_node));
             }
@@ -476,8 +481,9 @@ impl Cassette {
                 let recorded_simhash = u64::from_str_radix(&node.prompt_simhash, 16).unwrap_or(0);
                 let score = simhash_similarity(incoming_simhash, recorded_simhash);
                 // CT-BUILD-01: Option::is_none_or stabilized in Rust
-                // 1.82, after the declared MSRV 1.78. Written out
-                // explicitly so the crate still builds on 1.78.
+                // 1.82. Written out explicitly (retained as-is
+                // after the second-audit MSRV raise to 1.88, which
+                // was driven by dependency floors, not this code).
                 let is_better = match best_candidate {
                     None => true,
                     Some((_, best)) => score > best,
@@ -512,10 +518,32 @@ impl Cassette {
     }
 }
 
+/// Strip ONLY the volatile JSON-RPC envelope id (SECOND AUDIT
+/// P0/P2). A top-level `"id"` is removed if and only if the
+/// payload is a JSON-RPC 2.0 message. Any other top-level `"id"`,
+/// and every nested `"id"` at any depth, is a business identifier
+/// and is preserved. This is what separates the envelope (which
+/// legitimately changes per request) from identifiers (which must
+/// never be silently ignored).
+pub fn strip_mcp_envelope_id(payload: &Value) -> Value {
+    if let Value::Object(map) = payload {
+        let is_rpc = map.get("jsonrpc").and_then(|v| v.as_str()) == Some("2.0");
+        if is_rpc {
+            let mut cloned = map.clone();
+            cloned.remove("id");
+            return Value::Object(cloned);
+        }
+    }
+    payload.clone()
+}
+
 pub fn compute_safety_critical_hash(payload: &Value) -> String {
+    // SECOND AUDIT P2: normalize the envelope id first, then
+    // collect everything else — including nested business ids.
+    let normalized = strip_mcp_envelope_id(payload);
     let mut extracted = BTreeMap::new();
-    collect_safety_critical_fields("", payload, &mut extracted);
-    let numeric_tokens = extract_numeric_and_id_tokens(payload);
+    collect_safety_critical_fields("", &normalized, &mut extracted);
+    let numeric_tokens = extract_numeric_and_id_tokens(&normalized);
     let envelope = json!({
         "critical_fields": extracted,
         "numeric_and_id_tokens": numeric_tokens,
@@ -559,8 +587,14 @@ fn collect_string_literals(value: &Value, out: &mut Vec<String>) {
         Value::String(s) => {
             for word in s.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '.') {
                 let trimmed = word.trim_matches('.');
-                if !trimmed.is_empty() && trimmed.chars().any(|c| c.is_ascii_digit()) {
-                    out.push(trimmed.to_ascii_uppercase());
+                // SECOND AUDIT P2: Unicode-aware digit test.
+                // `is_ascii_digit` silently dropped identifiers
+                // written with non-ASCII digits (e.g. Arabic-Indic
+                // digits); `is_numeric` counts Unicode decimal
+                // digits as well. Upper-casing is likewise
+                // Unicode-aware (ASCII results unchanged).
+                if !trimmed.is_empty() && trimmed.chars().any(|c| c.is_numeric()) {
+                    out.push(trimmed.to_uppercase());
                 }
             }
         }
@@ -572,7 +606,18 @@ fn collect_string_literals(value: &Value, out: &mut Vec<String>) {
         }
         Value::Object(map) => {
             for (k, v) in map {
-                if k != "id" {
+                // SECOND AUDIT P2: a bare "id" key below the
+                // envelope is a business identifier. Its value
+                // counts verbatim — even with no digits — instead
+                // of being dropped by the old `k != "id"` filter,
+                // which globally ignored every field named "id".
+                if k == "id" {
+                    match v {
+                        Value::String(s) => out.push(s.clone()),
+                        Value::Number(n) => out.push(n.to_string()),
+                        other => out.push(serde_json::to_string(other).unwrap_or_default()),
+                    }
+                } else {
                     collect_string_literals(v, out);
                 }
             }
@@ -874,12 +919,10 @@ mod tests {
         );
         assert!(res.is_err(), "critical amount change must not replay");
 
-        // Non-critical change: booleans are not part of the
-        // safety hash (only critical fields, strings, and numbers
-        // are), so toggling one may still match structurally, as
-        // before. Numbers and strings are safety-relevant here by
-        // design, so they are deliberately not used as the benign
-        // control.
+        // SECOND AUDIT P0 SUPERSEDES the previous cycle's
+        // tolerance here: a boolean-only change is still an
+        // argument change, and MCP replay is now strict — it
+        // must MISS, not match structurally.
         let req_benign = json!({
             "tool": "issue_refund",
             "arguments": {"amount": 50, "currency": "USD", "dry_run": false}
@@ -892,8 +935,8 @@ mod tests {
             &req_benign,
         );
         assert!(
-            matches!(res, Ok(MatchResult::Exact(_))),
-            "non-critical boolean change keeps structural fallback"
+            res.is_err(),
+            "second-audit P0: even a boolean-only MCP argument change must fail closed"
         );
     }
 
@@ -933,5 +976,159 @@ mod tests {
             })
             .expect_err("depth 5 must exceed a max_depth of 2");
         assert!(matches!(err, TraceError::InvalidDag(_)));
+    }
+
+    // SECOND AUDIT P0: MCP replay is strict. Any argument change —
+    // critical or not — must miss. Only the volatile JSON-RPC
+    // envelope id may differ. (Pre-fix, the structural fallback
+    // still matched boolean-only and added-argument changes.)
+    #[test]
+    fn mcp_strict_argument_matching_fails_closed_on_any_change() {
+        fn mcp_req(
+            id: u64,
+            amount: u64,
+            order_id: &str,
+            recipient: &str,
+            qty: u64,
+            extra: bool,
+            dry_run: bool,
+        ) -> Value {
+            let mut args = json!({
+                "amount": amount,
+                "order_id": order_id,
+                "recipient": recipient,
+                "items": [{"sku": "A", "qty": qty}],
+                "dry_run": dry_run,
+            });
+            if extra {
+                args.as_object_mut()
+                    .unwrap()
+                    .insert("note".to_string(), json!("x"));
+            }
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": "charge", "arguments": args},
+            })
+        }
+        let tools = json!([{"name": "charge"}]);
+        let mut cassette = Cassette::new("mcp_strict", 0.80);
+        cassette.record_node(
+            None,
+            InteractionKind::McpToolCall,
+            "charge",
+            &tools,
+            mcp_req(7, 50, "ORD-1", "user_42", 1, false, true),
+            json!({"charged": true}),
+            1,
+        );
+        let attempt = |req: Value| {
+            cassette.match_request(&None, &InteractionKind::McpToolCall, "charge", &tools, &req)
+        };
+        // Control: identical everything -> Exact.
+        assert!(matches!(
+            attempt(mcp_req(7, 50, "ORD-1", "user_42", 1, false, true)),
+            Ok(MatchResult::Exact(_))
+        ));
+        // Volatile envelope id only -> still Exact.
+        assert!(matches!(
+            attempt(mcp_req(99, 50, "ORD-1", "user_42", 1, false, true)),
+            Ok(MatchResult::Exact(_))
+        ));
+        // Every argument change below must MISS.
+        for (label, req) in [
+            (
+                "amount",
+                mcp_req(7, 500, "ORD-1", "user_42", 1, false, true),
+            ),
+            (
+                "order_id",
+                mcp_req(7, 50, "ORD-2", "user_42", 1, false, true),
+            ),
+            (
+                "recipient",
+                mcp_req(7, 50, "ORD-1", "user_43", 1, false, true),
+            ),
+            (
+                "nested qty",
+                mcp_req(7, 50, "ORD-1", "user_42", 2, false, true),
+            ),
+            (
+                "added arg",
+                mcp_req(7, 50, "ORD-1", "user_42", 1, true, true),
+            ),
+            (
+                "boolean only",
+                mcp_req(7, 50, "ORD-1", "user_42", 1, false, false),
+            ),
+        ] {
+            assert!(
+                attempt(req).is_err(),
+                "MCP argument change ({label}) must fail closed"
+            );
+        }
+        // Missing argument: recipient dropped -> Miss.
+        let mut missing = mcp_req(7, 50, "ORD-1", "user_42", 1, false, true);
+        missing["params"]["arguments"]
+            .as_object_mut()
+            .unwrap()
+            .remove("recipient");
+        assert!(
+            attempt(missing).is_err(),
+            "MCP missing argument must fail closed"
+        );
+    }
+
+    // SECOND AUDIT P2: business identifiers count toward the
+    // safety hash; only the JSON-RPC envelope id is volatile.
+    #[test]
+    fn safety_hash_counts_nested_and_unicode_business_ids() {
+        // Bare nested "id" (business identifier), digit-bearing.
+        let a = json!({"params": {"id": "ORD-900"}});
+        let b = json!({"params": {"id": "ORD-901"}});
+        assert_ne!(
+            compute_safety_critical_hash(&a),
+            compute_safety_critical_hash(&b),
+            "nested business id change must change the safety hash"
+        );
+        // Bare nested "id" with no ASCII digits at all.
+        let a = json!({"params": {"id": "alpha"}});
+        let b = json!({"params": {"id": "beta"}});
+        assert_ne!(
+            compute_safety_critical_hash(&a),
+            compute_safety_critical_hash(&b),
+            "alphabetic business id change must change the safety hash"
+        );
+        // Unicode digits count as digits.
+        let a = json!({"note": "order ٩٠٠"});
+        let b = json!({"note": "order ٩٠١"});
+        assert_ne!(
+            compute_safety_critical_hash(&a),
+            compute_safety_critical_hash(&b),
+            "Unicode-digit change must change the safety hash"
+        );
+        // But the volatile JSON-RPC envelope id must NOT change it.
+        let a = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call"});
+        let b = json!({"jsonrpc": "2.0", "id": 99, "method": "tools/call"});
+        assert_eq!(
+            compute_safety_critical_hash(&a),
+            compute_safety_critical_hash(&b),
+            "envelope id change must not change the safety hash"
+        );
+        // Explicit critical keys: transaction_id and recipient_id.
+        let a = json!({"transaction_id": "txn_abc", "recipient_id": "user_abc"});
+        let b = json!({"transaction_id": "txn_abd", "recipient_id": "user_abc"});
+        assert_ne!(
+            compute_safety_critical_hash(&a),
+            compute_safety_critical_hash(&b),
+            "transaction_id change must change the safety hash"
+        );
+        let c = json!({"transaction_id": "txn_abc", "recipient_id": "user_abd"});
+        assert_ne!(
+            compute_safety_critical_hash(&a),
+            compute_safety_critical_hash(&c),
+            "recipient_id change must change the safety hash"
+        );
     }
 }
