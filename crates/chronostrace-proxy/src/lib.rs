@@ -43,7 +43,7 @@ async fn handle_mcp_replay(
     process_interaction(state, InteractionKind::McpToolCall, payload).await
 }
 
-async fn process_interaction(
+pub async fn process_interaction(
     state: Arc<Mutex<ProxyState>>,
     kind: InteractionKind,
     raw_request: Value,
@@ -151,4 +151,111 @@ fn extract_structural_tools(req: &Value) -> Value {
         return params.clone();
     }
     Value::Null
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chronostrace_chaos::{ChaosProfile, FaultKind};
+    use mcp_stdio::extract_mcp_matching_features;
+
+    fn sample_proxy_state(chaos: Option<ChaosEngine>) -> Arc<Mutex<ProxyState>> {
+        let mut cassette = Cassette::new("proxy_unit_test", 0.80);
+        let tools = json!([{"name": "verify_order"}]);
+        let prompt = "You are a helpful financial refund agent. Verify order ORD-900 for $50.";
+        let req = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "system", "content": prompt}],
+            "tools": tools
+        });
+        let resp = json!({"choices": [{"message": {"content": "Verified ORD-900"}}]});
+        cassette.record_node(
+            None,
+            InteractionKind::LlmCompletion,
+            prompt,
+            &tools,
+            req,
+            resp,
+            15,
+        );
+
+        Arc::new(Mutex::new(ProxyState {
+            cassette,
+            current_parent_id: None,
+            scrubber: SecretScrubber::new(),
+            chaos,
+        }))
+    }
+
+    #[tokio::test]
+    async fn proxy_returns_200_on_exact_and_fuzzy_match() {
+        let state = sample_proxy_state(None);
+        let req = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "system", "content": "You are a helpful financial refund assistant! Verify order ORD-900 for $50."}],
+            "tools": [{"name": "verify_order"}]
+        });
+
+        let (status, _, Json(body)) =
+            process_interaction(state.clone(), InteractionKind::LlmCompletion, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["choices"][0]["message"]["content"], "Verified ORD-900");
+        assert!(state.lock().unwrap().current_parent_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn proxy_returns_412_on_safety_critical_amount_mutation() {
+        let state = sample_proxy_state(None);
+        let mutated_req = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "system", "content": "You are a helpful financial refund agent. Verify order ORD-900 for $500."}],
+            "tools": [{"name": "verify_order"}]
+        });
+
+        let (status, _, Json(body)) =
+            process_interaction(state, InteractionKind::LlmCompletion, mutated_req).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["error"], "CHRONOSTRACE_REPLAY_MISS");
+    }
+
+    #[tokio::test]
+    async fn proxy_injects_http_429_with_retry_after_header_and_preserves_parent_id() {
+        let chaos = ChaosEngine::new(ChaosProfile {
+            name: "rate_limit_test".into(),
+            seed: 7,
+            probability: 1.0,
+            fault: FaultKind::Http429RateLimit {
+                retry_after_secs: 3,
+            },
+        });
+        let state = sample_proxy_state(Some(chaos));
+        let req = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "system", "content": "You are a helpful financial refund agent. Verify order ORD-900 for $50."}],
+            "tools": [{"name": "verify_order"}]
+        });
+
+        let (status, headers, _) =
+            process_interaction(state.clone(), InteractionKind::LlmCompletion, req).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            headers.get(header::RETRY_AFTER).unwrap().to_str().unwrap(),
+            "3"
+        );
+        // Pointer parent tidak boleh maju jika request gagal karena HTTP 429 sehingga retry berikutnya tetap cocok
+        assert!(state.lock().unwrap().current_parent_id.is_none());
+    }
+
+    #[test]
+    fn mcp_feature_extractor_handles_tools_call_and_sampling() {
+        let tool_req = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "verify_order", "arguments": {"order_id": "ORD-900"}}
+        });
+        let (prompt, structural) = extract_mcp_matching_features(&tool_req);
+        assert!(prompt.contains("tools/call"));
+        assert_eq!(structural["method"], "tools/call");
+        assert_eq!(structural["params"]["name"], "verify_order");
+    }
 }

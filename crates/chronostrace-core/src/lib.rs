@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use simhash::{compute_simhash, simhash_similarity};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
@@ -293,16 +294,16 @@ impl Cassette {
         let mut best_candidate: Option<(&TraceNode, f64)> = None;
 
         for node in &self.nodes {
-            let node_safety = if node.safety_critical_hash.is_empty() {
-                compute_safety_critical_hash(&node.request_payload)
+            let node_safety: Cow<'_, str> = if node.safety_critical_hash.is_empty() {
+                Cow::Owned(compute_safety_critical_hash(&node.request_payload))
             } else {
-                node.safety_critical_hash.clone()
+                Cow::Borrowed(node.safety_critical_hash.as_str())
             };
 
             if &node.parent_id == parent_id
                 && &node.kind == kind
                 && node.structural_tool_hash == tool_hash
-                && node_safety == safety_hash
+                && node_safety.as_ref() == safety_hash.as_str()
             {
                 let recorded_simhash = u64::from_str_radix(&node.prompt_simhash, 16).unwrap_or(0);
                 let score = simhash_similarity(incoming_simhash, recorded_simhash);

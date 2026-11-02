@@ -35,3 +35,6 @@ bindings = "bin"
 python-source = "."
 module-name = "pytest_chronostrace"
 strip = true
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
