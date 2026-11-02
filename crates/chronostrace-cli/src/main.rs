@@ -281,6 +281,10 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 None
             };
 
+            // SECOND AUDIT P1: remember whether the cassette
+            // file pre-existed, for the scrubbed-metadata gate at
+            // save time (see below).
+            let cassette_existed = cassette.exists();
             let loaded = if cassette.exists() {
                 Cassette::load_from_file(&cassette)?
             } else if is_record {
@@ -332,7 +336,20 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 let mut guard = state_for_save.lock().expect("ProxyState mutex poisoned");
                 let policy = guard.scrubber.policy_version();
                 let redactions = guard.scrubber.total_redactions();
-                guard.cassette.mark_scrubbed(policy, redactions);
+                // SECOND AUDIT P1: scrubbed metadata must only be
+                // set after the complete pipeline succeeds FOR THE
+                // WHOLE CASSETTE. Appending to an existing
+                // cassette mixes pre-existing nodes (which never
+                // passed through this run's scrubber) with new
+                // scrubbed nodes, so marking the whole cassette
+                // scrubbed would be false. Only mark when the
+                // cassette is fresh (every node was scrubbed in
+                // this run) or was already marked scrubbed when
+                // loaded (old nodes already passed a pipeline,
+                // and new nodes are scrubbed too).
+                if !cassette_existed || guard.cassette.metadata.scrubbed {
+                    guard.cassette.mark_scrubbed(policy, redactions);
+                }
                 guard.cassette.save_to_file(&cassette)?;
                 tracing::info!(
                     "ChronosTrace recorded cassette saved to {} ({} nodes)",

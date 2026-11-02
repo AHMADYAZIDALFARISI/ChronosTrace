@@ -253,6 +253,7 @@ async fn run_bidirectional_child_proxy(
         );
     }
 
+    let cassette_existed = config.cassette_path.exists();
     let mut cassette = if config.cassette_path.exists() {
         Cassette::load_from_file(&config.cassette_path)?
     } else {
@@ -263,6 +264,10 @@ async fn run_bidirectional_child_proxy(
             .unwrap_or("mcp_session");
         Cassette::new(stem, config.similarity_threshold)
     };
+    // SECOND AUDIT P1: same whole-cassette gate as the CLI HTTP
+    // record path. Appending to an existing unmarked cassette
+    // must not retroactively mark its old nodes scrubbed.
+    let may_mark_scrubbed = !cassette_existed || cassette.metadata.scrubbed;
 
     let exe = &config.child_command[0];
     let args = &config.child_command[1..];
@@ -454,7 +459,9 @@ async fn run_bidirectional_child_proxy(
             }
             in_flight.clear();
             recorder.flush(&mut cassette, &mut current_parent_id);
-            cassette.mark_scrubbed(scrubber.policy_version(), scrubber.total_redactions());
+            if may_mark_scrubbed {
+                cassette.mark_scrubbed(scrubber.policy_version(), scrubber.total_redactions());
+            }
             let persist_result = persist_cassette(&cassette, &config.cassette_path);
             // A child that closed stdout but lingers gets killed after
             // a grace period; waiting forever is not an option.
@@ -500,14 +507,18 @@ async fn run_bidirectional_child_proxy(
         }
         Ok(BreakReason::Signal) => {
             recorder.flush(&mut cassette, &mut current_parent_id);
-            cassette.mark_scrubbed(scrubber.policy_version(), scrubber.total_redactions());
+            if may_mark_scrubbed {
+                cassette.mark_scrubbed(scrubber.policy_version(), scrubber.total_redactions());
+            }
             persist_cassette(&cassette, &config.cassette_path)?;
             let _ = child.kill().await;
             Err("interrupted by signal; partial cassette persisted".into())
         }
         Ok(BreakReason::HostEof) => {
             recorder.flush(&mut cassette, &mut current_parent_id);
-            cassette.mark_scrubbed(scrubber.policy_version(), scrubber.total_redactions());
+            if may_mark_scrubbed {
+                cassette.mark_scrubbed(scrubber.policy_version(), scrubber.total_redactions());
+            }
             persist_cassette(&cassette, &config.cassette_path)?;
             let _ = child.kill().await;
             Ok(())
@@ -515,7 +526,9 @@ async fn run_bidirectional_child_proxy(
         Err(e) => {
             // I/O error mid-loop: persist what was recorded, then report.
             recorder.flush(&mut cassette, &mut current_parent_id);
-            cassette.mark_scrubbed(scrubber.policy_version(), scrubber.total_redactions());
+            if may_mark_scrubbed {
+                cassette.mark_scrubbed(scrubber.policy_version(), scrubber.total_redactions());
+            }
             let _ = persist_cassette(&cassette, &config.cassette_path);
             let _ = child.kill().await;
             Err(e)

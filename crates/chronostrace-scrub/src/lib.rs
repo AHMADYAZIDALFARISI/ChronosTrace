@@ -136,6 +136,27 @@ impl SecretScrubber {
                 Regex::new(r"eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+").unwrap(),
                 "[REDACTED_JWT]",
             ),
+            // SECOND AUDIT P1: credentials embedded in URLs. URLs
+            // are explicitly excluded from entropy redaction below,
+            // so without these patterns a userinfo password or a
+            // query-string secret survived verbatim. The host,
+            // path, and benign query params survive; only the
+            // credential part is replaced. These run last so
+            // known-token patterns (ghp_, AKIA, ...) win first.
+            (
+                Regex::new(r"(://[^/\s:]+:)[^/\s@]+@").unwrap(),
+                "${1}[REDACTED]@",
+            ),
+            (
+                // Normal (non-raw) string literal: the pattern must
+                // contain a literal double-quote in its char class,
+                // which a raw string cannot express.
+                Regex::new(
+                    "(?i)([?&](?:api_key|apikey|access_token|refresh_token|token|secret|password|client_secret)=)[^&\\s\"']*",
+                )
+                .unwrap(),
+                "${1}[REDACTED]",
+            ),
         ];
         Self {
             patterns,
@@ -179,12 +200,20 @@ impl SecretScrubber {
                         || lower_k.contains("apikey")
                         || lower_k == "authorization"
                         || lower_k == "x-api-key"
-                        || lower_k == "cookie"
-                        || lower_k == "set-cookie"
+                        // SECOND AUDIT P1: "cookie" as a substring
+                        // covers cookie, cookies, and set-cookie
+                        // (the old exact match missed "cookies").
+                        || lower_k.contains("cookie")
                         || lower_k.contains("secret")
                         || lower_k.contains("password")
                         || lower_k.contains("passwd")
                         || lower_k.contains("pwd")
+                        // SECOND AUDIT P1: a private key under its
+                        // own name must redact even when the value
+                        // is not a PEM block (hex keys have entropy
+                        // below the threshold and survived).
+                        || lower_k.contains("private_key")
+                        || lower_k == "privatekey"
                         || is_token_key
                     {
                         self.redaction_counter.fetch_add(1, Ordering::Relaxed);
@@ -216,8 +245,25 @@ impl SecretScrubber {
         output
             .split_whitespace()
             .map(|token| {
-                let clean =
-                    token.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';');
+                // SECOND AUDIT P1: tokenization boundaries. The old
+                // trim set left secrets wrapped in parentheses,
+                // braces, or angle brackets with their wrappers
+                // attached, which skewed the entropy check. Square
+                // brackets are deliberately NOT trimmed: redaction
+                // markers start with "[REDACTED" and must keep
+                // passing the exclusion check below.
+                let clean = token.trim_matches(|c: char| {
+                    c == '"'
+                        || c == '\''
+                        || c == ','
+                        || c == ';'
+                        || c == '('
+                        || c == ')'
+                        || c == '{'
+                        || c == '}'
+                        || c == '<'
+                        || c == '>'
+                });
                 if clean.len() >= 32
                     && !clean.starts_with("[REDACTED")
                     && !clean.starts_with("http://")
@@ -404,5 +450,85 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         assert_eq!(proof.payload_sha256, expected);
+    }
+
+    // SECOND AUDIT P1: the mission's full sensitive-key list must
+    // redact, including plural/compound keys the old rule missed.
+    #[test]
+    fn second_audit_sensitive_keys_all_redact() {
+        let scrubber = SecretScrubber::new();
+        let payload = json!({
+            "token": "tok_value_123",
+            "access_token": "acc_value_123",
+            "refresh_token": "ref_value_123",
+            "session_token": "ses_value_123",
+            "client_secret": "cli_value_123",
+            "authorization": "Bearer abcdefghijklmnop",
+            "cookie": "session=abc123",
+            "cookies": "session=abc123",
+            "private_key": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6",
+        });
+        let scrubbed = scrubber.scrub_json(&payload).to_string();
+        for leaked in [
+            "tok_value_123",
+            "acc_value_123",
+            "ref_value_123",
+            "ses_value_123",
+            "cli_value_123",
+            "session=abc123",
+            "a1b2c3d4e5f6",
+        ] {
+            assert!(
+                !scrubbed.contains(leaked),
+                "sensitive value must not survive scrubbing: {leaked}"
+            );
+        }
+    }
+
+    // SECOND AUDIT P1: secrets embedded in URLs and structured
+    // text must not survive. URLs were explicitly excluded from
+    // entropy redaction and had no credential pattern.
+    #[test]
+    fn second_audit_url_and_structured_text_secrets_redact() {
+        let scrubber = SecretScrubber::new();
+        let userinfo = scrubber.scrub_str("https://alice:s3cret-pass@api.example.com/v1");
+        assert!(
+            !userinfo.contains("s3cret-pass"),
+            "userinfo password leaked: {userinfo}"
+        );
+        assert!(
+            userinfo.contains("api.example.com"),
+            "host must survive: {userinfo}"
+        );
+        let query =
+            scrubber.scrub_str("https://api.example.com/v1?api_key=supersecretvalue123&x=1");
+        assert!(
+            !query.contains("supersecretvalue123"),
+            "query api_key leaked: {query}"
+        );
+        assert!(
+            query.contains("x=1"),
+            "benign query param must survive: {query}"
+        );
+        let sentence =
+            scrubber.scrub_str("please use token ghp_FAKEFAKEFAKEFAKEFAKEFAKE1234 for this");
+        assert!(
+            !sentence.contains("FAKEFAKE"),
+            "embedded token leaked: {sentence}"
+        );
+        assert!(
+            sentence.contains("please use token"),
+            "surrounding text must survive"
+        );
+        // High-entropy standalone token, and a Unicode high-entropy
+        // token (entropy is computed over chars, not bytes).
+        let token = "Xy9Qw8Er7Tz2Kp5Lm0Nn4Vb6Cx1Za3Sd8Fg7Hj2Kk9Lp3Mq6Wr5Ty0Ui8Op4As2Df";
+        assert!(!scrubber.scrub_str(token).contains(token));
+        let uni = "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろ";
+        assert_ne!(
+            scrubber.scrub_str(uni),
+            uni,
+            "unicode high-entropy token must redact"
+        );
     }
 }

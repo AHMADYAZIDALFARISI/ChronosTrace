@@ -2537,4 +2537,44 @@ mod tests {
             .unwrap();
         assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
+
+    // SECOND AUDIT P1: known test secrets must not appear in
+    // serialized cassette output after the scrub pipeline.
+    #[test]
+    fn second_audit_secrets_absent_from_serialized_cassette() {
+        let scrubber = SecretScrubber::new();
+        let raw_req = json!({
+            "model": "gpt-4o",
+            "messages": [{"content": "hi"}],
+            "api_key": "sk-ant-api03-FAKEFAKEFAKEFAKE1234",
+            "headers": {"authorization": "Bearer abcdefghijklmnop"},
+        });
+        let raw_resp = json!({"token": "tok_value_123", "text": "ok"});
+        let mut cassette = Cassette::new("secret_serialization", 0.80);
+        let tools = json!([{"name": "noop"}]);
+        cassette.record_node(
+            None,
+            InteractionKind::LlmCompletion,
+            "hi",
+            &tools,
+            scrubber.scrub_json(&raw_req),
+            scrubber.scrub_json(&raw_resp),
+            1,
+        );
+        let dir =
+            std::env::temp_dir().join(format!("chronostrace-secret-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.ctrace");
+        cassette.save_to_file(&target).unwrap();
+        let text = std::fs::read_to_string(&target).unwrap();
+        for leaked in ["FAKEFAKEFAKEFAKE", "abcdefghijklmnop", "tok_value_123"] {
+            assert!(
+                !text.contains(leaked),
+                "secret leaked into serialized cassette: {leaked}"
+            );
+        }
+        assert!(text.contains("REDACTED"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
