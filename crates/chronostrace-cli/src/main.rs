@@ -4,7 +4,7 @@ use chronostrace_chaos::{ChaosEngine, ChaosProfile, FaultKind};
 use chronostrace_core::diff::{diff_cassettes, TrajectoryDiffReport};
 use chronostrace_core::Cassette;
 use chronostrace_proxy::mcp_stdio::{run_mcp_stdio_wrapper, McpStdioConfig, McpWrapMode};
-use chronostrace_proxy::{build_router, ProxyState};
+use chronostrace_proxy::{build_router, ProxyState, UpstreamTarget};
 use chronostrace_scrub::SecretScrubber;
 use clap::{Parser, Subcommand, ValueEnum};
 use diff_render::{render_markdown_diff, render_terminal_diff};
@@ -21,6 +21,12 @@ use std::sync::{Arc, Mutex};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, ValueEnum)]
+enum ReplayModeArg {
+    Replay,
+    Record,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -46,6 +52,17 @@ enum Commands {
         bind: String,
         #[arg(long)]
         chaos_rate_limit_prob: Option<f64>,
+        /// Replay recorded responses (default), or forward to a live
+        /// upstream and record the scrubbed traffic into the cassette.
+        #[arg(short, long, value_enum, default_value_t = ReplayModeArg::Replay)]
+        mode: ReplayModeArg,
+        /// Upstream base URL for record mode, e.g. http://127.0.0.1:8000.
+        #[arg(long)]
+        upstream: Option<String>,
+        /// Similarity threshold for a cassette created fresh in record
+        /// mode (ignored when appending to an existing file).
+        #[arg(long, default_value_t = 0.85)]
+        similarity_threshold: f64,
     },
     McpWrap {
         #[arg(short, long)]
@@ -111,8 +128,38 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             cassette,
             bind,
             chaos_rate_limit_prob,
+            mode,
+            upstream,
+            similarity_threshold,
         } => {
-            let loaded = Cassette::load_from_file(&cassette)?;
+            let is_record = matches!(mode, ReplayModeArg::Record);
+            let upstream_target = if is_record {
+                let base = upstream.ok_or("record mode requires --upstream <base-url>")?;
+                Some(UpstreamTarget::new(&base)?)
+            } else {
+                None
+            };
+
+            let loaded = if cassette.exists() {
+                Cassette::load_from_file(&cassette)?
+            } else if is_record {
+                let stem = cassette
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("chronostrace");
+                Cassette::new(stem.to_string(), similarity_threshold)
+            } else {
+                return Err(format!("cassette not found: {}", cassette.display()).into());
+            };
+
+            // In record mode, appending to an existing cassette continues
+            // the recorded trajectory from its last node.
+            let initial_parent = if is_record {
+                loaded.nodes.last().map(|n| n.node_id.clone())
+            } else {
+                None
+            };
+
             let chaos = chaos_rate_limit_prob.map(|prob| {
                 ChaosEngine::new(ChaosProfile {
                     name: "cli_rate_limit".into(),
@@ -126,17 +173,39 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
             let state = Arc::new(Mutex::new(ProxyState {
                 cassette: loaded,
-                current_parent_id: None,
+                current_parent_id: initial_parent,
                 sessions: std::collections::HashMap::new(),
                 scrubber: SecretScrubber::new(),
                 chaos,
+                upstream: upstream_target,
             }));
 
+            let state_for_save = state.clone();
             let app = build_router(state);
             let listener = tokio::net::TcpListener::bind(&bind).await?;
             let actual_addr = listener.local_addr()?;
-            tracing::info!("ChronosTrace HTTP replay daemon listening on http://{actual_addr}");
-            axum::serve(listener, app).await?;
+            tracing::info!(
+                "ChronosTrace HTTP {} daemon listening on http://{actual_addr}",
+                if is_record { "record" } else { "replay" }
+            );
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+            if is_record {
+                // Graceful shutdown is the save point: recorded nodes live
+                // in memory until Ctrl+C / SIGTERM, then the cassette is
+                // written once, atomically.
+                let mut guard = state_for_save.lock().expect("ProxyState mutex poisoned");
+                let policy = guard.scrubber.policy_version();
+                let redactions = guard.scrubber.total_redactions();
+                guard.cassette.mark_scrubbed(policy, redactions);
+                guard.cassette.save_to_file(&cassette)?;
+                tracing::info!(
+                    "ChronosTrace recorded cassette saved to {} ({} nodes)",
+                    cassette.display(),
+                    guard.cassette.nodes.len()
+                );
+            }
             Ok(ExitCode::SUCCESS)
         }
 
@@ -262,6 +331,32 @@ fn diff_exit_code(report: &TrajectoryDiffReport, fail_on_divergence: bool) -> u8
     }
 }
 
+/// Wait for Ctrl+C (or SIGTERM on Unix) so the replay/record daemon can
+/// shut down gracefully. In record mode this is the save point: the
+/// cassette is written only after this signal arrives.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,10 +396,35 @@ mod tests {
                 cassette,
                 bind,
                 chaos_rate_limit_prob,
+                mode,
+                upstream,
+                similarity_threshold,
             } => {
                 assert_eq!(cassette, PathBuf::from("a.ctrace"));
                 assert_eq!(bind, "127.0.0.1:8787");
                 assert!(chaos_rate_limit_prob.is_none());
+                assert!(matches!(mode, ReplayModeArg::Replay));
+                assert!(upstream.is_none());
+                assert_eq!(similarity_threshold, 0.85);
+            }
+            _ => panic!("expected Replay"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "chronostrace",
+            "replay",
+            "--cassette",
+            "b.ctrace",
+            "--mode",
+            "record",
+            "--upstream",
+            "http://127.0.0.1:9000",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Replay { mode, upstream, .. } => {
+                assert!(matches!(mode, ReplayModeArg::Record));
+                assert_eq!(upstream.as_deref(), Some("http://127.0.0.1:9000"));
             }
             _ => panic!("expected Replay"),
         }

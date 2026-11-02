@@ -112,21 +112,47 @@ Options verified from `--help`:
 - `--cassette <CASSETTE>` (required)
 - `--bind <BIND>` (default: `127.0.0.1:8787`)
 - `--chaos-rate-limit-prob <PROB>` (inject HTTP 429 faults with this
-  probability)
+  probability; replay mode only)
+- `--mode <MODE>` (`replay`, `record`; default: `replay`)
+- `--upstream <BASE_URL>` (required in record mode, e.g.
+  `http://127.0.0.1:8000`)
+- `--similarity-threshold <THRESHOLD>` (default: `0.85`; used only when
+  record mode creates a fresh cassette)
 
 The replay server serves OpenAI-compatible paths under `/v1` and MCP HTTP
 calls under `/mcp/call`. A request with no matching recorded node returns
-HTTP `412` (`CHRONOSTRACE_REPLAY_MISS`).
-
-Scope: the replay server is replay-only. There is no HTTP record mode:
-requests are never forwarded to a live upstream, and the server writes
-no cassette. Responses are served as a single JSON body; SSE streaming
-(`stream: true`) is not supported. Only POST routes exist:
-`/v1/chat/completions`, `/v1/messages`, and `/mcp/call`. Recording is
-available for MCP stdio servers via `mcp-wrap --mode record` below.
+HTTP `412` (`CHRONOSTRACE_REPLAY_MISS`). Only POST routes exist:
+`/v1/chat/completions`, `/v1/messages`, and `/mcp/call`.
 Parallel HTTP clients should send distinct `X-ChronosTrace-Session`
 header values; each session gets its own DAG parent pointer, while
 requests without the header share the default pointer.
+
+#### Record mode
+
+```bash
+chronostrace replay --mode record --upstream http://127.0.0.1:8000 \
+  --cassette cassette.ctrace
+```
+
+In record mode the same server becomes a recording proxy: requests are
+forwarded to the live upstream, the client sees the upstream response
+verbatim, and the scrubbed request/response pair is appended to the
+cassette as a new node. JSON responses are stored as-is; SSE responses
+(`text/event-stream`) are stored as a chunk list under the
+`_chronostrace_sse` marker in the node's response payload, and replay
+streams those chunks back as `text/event-stream`. Only `Authorization`
+and `Content-Type` are forwarded upstream, and no header is ever stored
+in a cassette. Non-2xx upstream responses pass through to the client
+but are never recorded: replay serves recorded nodes with 200, so
+recording an error would replay it as a success. Recording stops on
+Ctrl+C / SIGTERM — that is the save point, when the cassette is written
+once, atomically. Appending to an existing cassette continues the
+recorded trajectory from its last node. MCP stdio recording is available
+separately via `mcp-wrap --mode record` below.
+
+Limitations: the record client connects directly (no environment
+proxies) and never follows redirects. Chaos fault injection applies to
+JSON replays only, not to SSE streams.
 
 ### `mcp-wrap`
 

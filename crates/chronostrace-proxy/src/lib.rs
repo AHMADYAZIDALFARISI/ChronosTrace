@@ -1,19 +1,60 @@
+pub mod http_record;
 pub mod mcp_stdio;
 
 use axum::{
+    body::Body,
     extract::State,
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::IntoResponse,
+    response::{
+        sse::{Event, Sse},
+        IntoResponse, Response,
+    },
     routing::post,
     Json, Router,
 };
 use chronostrace_chaos::{ChaosEngine, ChaosOutcome};
 use chronostrace_core::{Cassette, InteractionKind, MatchResult};
 use chronostrace_scrub::SecretScrubber;
+use futures_util::stream;
+use http_record::{
+    forward_to_upstream, parse_sse_body, scrub_sse_chunk, sse_chunks_from_payload,
+    sse_marker_payload,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Live upstream for HTTP record mode. Absent in replay mode.
+#[derive(Clone)]
+pub struct UpstreamTarget {
+    pub base_url: String,
+    pub client: reqwest::Client,
+}
+
+impl UpstreamTarget {
+    /// Validate the base URL and build the forwarding client. The client
+    /// connects directly (no environment proxies) and never follows
+    /// redirects, so the recorded response is exactly what the upstream
+    /// at this URL returned.
+    pub fn new(base_url: &str) -> Result<Self, String> {
+        let trimmed = base_url.trim_end_matches('/');
+        let parsed =
+            reqwest::Url::parse(trimmed).map_err(|e| format!("invalid upstream URL: {e}"))?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err("upstream URL must use http or https".into());
+        }
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            base_url: parsed.to_string().trim_end_matches('/').to_string(),
+            client,
+        })
+    }
+}
 
 pub struct ProxyState {
     pub cassette: Cassette,
@@ -25,12 +66,13 @@ pub struct ProxyState {
     pub sessions: HashMap<String, Option<String>>,
     pub scrubber: SecretScrubber,
     pub chaos: Option<ChaosEngine>,
+    pub upstream: Option<UpstreamTarget>,
 }
 
 pub fn build_router(state: Arc<Mutex<ProxyState>>) -> Router {
     Router::new()
-        .route("/v1/chat/completions", post(handle_llm_replay))
-        .route("/v1/messages", post(handle_llm_replay))
+        .route("/v1/chat/completions", post(handle_chat_completions))
+        .route("/v1/messages", post(handle_messages))
         .route("/mcp/call", post(handle_mcp_replay))
         .with_state(state)
 }
@@ -44,15 +86,31 @@ fn session_key(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn handle_llm_replay(
+async fn handle_chat_completions(
     State(state): State<Arc<Mutex<ProxyState>>>,
     headers: HeaderMap,
     Json(payload): Json<Value>,
-) -> impl IntoResponse {
-    process_interaction(
+) -> Response {
+    dispatch(
         state,
         InteractionKind::LlmCompletion,
-        session_key(&headers),
+        "/v1/chat/completions",
+        headers,
+        payload,
+    )
+    .await
+}
+
+async fn handle_messages(
+    State(state): State<Arc<Mutex<ProxyState>>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    dispatch(
+        state,
+        InteractionKind::LlmCompletion,
+        "/v1/messages",
+        headers,
         payload,
     )
     .await
@@ -62,14 +120,39 @@ async fn handle_mcp_replay(
     State(state): State<Arc<Mutex<ProxyState>>>,
     headers: HeaderMap,
     Json(payload): Json<Value>,
-) -> impl IntoResponse {
-    process_interaction(
+) -> Response {
+    dispatch(
         state,
         InteractionKind::McpToolCall,
-        session_key(&headers),
+        "/mcp/call",
+        headers,
         payload,
     )
     .await
+}
+
+async fn dispatch(
+    state: Arc<Mutex<ProxyState>>,
+    kind: InteractionKind,
+    path: &str,
+    headers: HeaderMap,
+    payload: Value,
+) -> Response {
+    let session = session_key(&headers);
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let is_record = state
+        .lock()
+        .expect("ProxyState mutex poisoned")
+        .upstream
+        .is_some();
+    if is_record {
+        record_interaction(state, kind, session, path, auth, payload).await
+    } else {
+        process_interaction(state, kind, session, payload).await
+    }
 }
 
 pub async fn process_interaction(
@@ -77,9 +160,15 @@ pub async fn process_interaction(
     kind: InteractionKind,
     session: Option<String>,
     raw_request: Value,
-) -> (StatusCode, HeaderMap, Json<Value>) {
+) -> Response {
+    enum Outcome {
+        Miss(String),
+        Sse(Vec<String>),
+        Chaos(ChaosOutcome),
+    }
+
     let mut headers = HeaderMap::new();
-    let (match_outcome, chaos_step) = {
+    let outcome = {
         let mut guard = state.lock().expect("ProxyState mutex poisoned");
         let scrubbed_req = guard.scrubber.scrub_json(&raw_request);
 
@@ -116,13 +205,10 @@ pub async fn process_interaction(
                         (node.node_id.clone(), node.response_payload.clone())
                     }
                 };
-                let chaos_res = guard
-                    .chaos
-                    .as_mut()
-                    .map(|c| c.apply(&resp_payload))
-                    .unwrap_or(ChaosOutcome::PassThrough(resp_payload));
-                // Hanya majukan pointer parent DAG apabila fault tidak menggagalkan step dengan HTTP error
-                if !matches!(chaos_res, ChaosOutcome::InjectedError { .. }) {
+                // SSE recordings stream back as event streams. Chaos fault
+                // injection applies to JSON payloads only and is skipped
+                // here so a mutated marker can never corrupt the stream.
+                if let Some(chunks) = sse_chunks_from_payload(&resp_payload) {
                     match &session {
                         Some(key) => {
                             guard.sessions.insert(key.clone(), Some(node_id));
@@ -131,47 +217,248 @@ pub async fn process_interaction(
                             guard.current_parent_id = Some(node_id);
                         }
                     }
+                    Outcome::Sse(chunks)
+                } else {
+                    let chaos_res = guard
+                        .chaos
+                        .as_mut()
+                        .map(|c| c.apply(&resp_payload))
+                        .unwrap_or(ChaosOutcome::PassThrough(resp_payload));
+                    // Hanya majukan pointer parent DAG apabila fault tidak menggagalkan step dengan HTTP error
+                    if !matches!(chaos_res, ChaosOutcome::InjectedError { .. }) {
+                        match &session {
+                            Some(key) => {
+                                guard.sessions.insert(key.clone(), Some(node_id));
+                            }
+                            None => {
+                                guard.current_parent_id = Some(node_id);
+                            }
+                        }
+                    }
+                    Outcome::Chaos(chaos_res)
                 }
-                (Ok(()), Some(chaos_res))
             }
-            Err(err) => (Err(err.to_string()), None),
+            Err(err) => Outcome::Miss(err.to_string()),
         }
     };
 
-    if let Err(err_msg) = match_outcome {
-        return (
+    match outcome {
+        Outcome::Miss(err_msg) => (
             StatusCode::PRECONDITION_FAILED,
-            headers,
             Json(json!({
                 "error": "CHRONOSTRACE_REPLAY_MISS",
                 "message": err_msg
             })),
-        );
+        )
+            .into_response(),
+        Outcome::Sse(chunks) => {
+            let stream = stream::iter(
+                chunks
+                    .into_iter()
+                    .map(|c| Ok::<_, std::convert::Infallible>(Event::default().data(c))),
+            );
+            Sse::new(stream).into_response()
+        }
+        Outcome::Chaos(chaos_step) => match chaos_step {
+            ChaosOutcome::PassThrough(body) | ChaosOutcome::MutatedPayload(body) => {
+                (StatusCode::OK, headers, Json(body)).into_response()
+            }
+            ChaosOutcome::DelayThenPassThrough { delay_ms, payload } => {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                (StatusCode::OK, headers, Json(payload)).into_response()
+            }
+            ChaosOutcome::InjectedError {
+                status_code,
+                retry_after_secs,
+                body,
+            } => {
+                if let Some(secs) = retry_after_secs {
+                    if let Ok(val) = HeaderValue::from_str(&secs.to_string()) {
+                        headers.insert(header::RETRY_AFTER, val);
+                    }
+                }
+                (
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    headers,
+                    Json(body),
+                )
+                    .into_response()
+            }
+        },
+    }
+}
+
+/// Record-mode counterpart of [`process_interaction`]: forward the
+/// scrubbed request to the configured upstream, store the scrubbed
+/// response as a new cassette node, and return the upstream response to
+/// the client verbatim. Error responses are passed through but never
+/// recorded: replay serves recorded nodes with 200, so recording an
+/// error would replay it as a success.
+pub async fn record_interaction(
+    state: Arc<Mutex<ProxyState>>,
+    kind: InteractionKind,
+    session: Option<String>,
+    path: &str,
+    auth: Option<String>,
+    raw_request: Value,
+) -> Response {
+    let (base_url, client) = {
+        let guard = state.lock().expect("ProxyState mutex poisoned");
+        match &guard.upstream {
+            Some(up) => (up.base_url.clone(), up.client.clone()),
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": "CHRONOSTRACE_NOT_RECORDING",
+                        "message": "record mode is not configured"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    // Scrub before forwarding: replay scrubs incoming requests before
+    // matching, so the recorded request must be the scrubbed form for
+    // exact matching to work later. Nothing unscrubbed is ever stored.
+    let (scrubbed_req, parent_id) = {
+        let guard = state.lock().expect("ProxyState mutex poisoned");
+        let scrubbed = guard.scrubber.scrub_json(&raw_request);
+        let parent = match &session {
+            Some(key) => guard.sessions.get(key).cloned().flatten(),
+            None => guard.current_parent_id.clone(),
+        };
+        (scrubbed, parent)
+    };
+
+    let started = Instant::now();
+    let forwarded =
+        forward_to_upstream(&client, &base_url, path, &scrubbed_req, auth.as_deref()).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let up = match forwarded {
+        Ok(up) => up,
+        Err(message) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": "CHRONOSTRACE_UPSTREAM_ERROR",
+                    "message": message
+                })),
+            )
+                .into_response();
+        }
+    };
+    if !(200..300).contains(&up.status) {
+        let status = StatusCode::from_u16(up.status).unwrap_or(StatusCode::BAD_GATEWAY);
+        return Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, up.content_type)
+            .body(Body::from(up.body))
+            .unwrap_or_else(|_| (status, "upstream error").into_response());
     }
 
-    match chaos_step.unwrap() {
-        ChaosOutcome::PassThrough(body) | ChaosOutcome::MutatedPayload(body) => {
-            (StatusCode::OK, headers, Json(body))
-        }
-        ChaosOutcome::DelayThenPassThrough { delay_ms, payload } => {
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            (StatusCode::OK, headers, Json(payload))
-        }
-        ChaosOutcome::InjectedError {
-            status_code,
-            retry_after_secs,
-            body,
-        } => {
-            if let Some(secs) = retry_after_secs {
-                if let Ok(val) = HeaderValue::from_str(&secs.to_string()) {
-                    headers.insert(header::RETRY_AFTER, val);
-                }
+    if up.content_type.contains("text/event-stream") {
+        let chunks = parse_sse_body(&up.body);
+        let stored_chunks = {
+            let guard = state.lock().expect("ProxyState mutex poisoned");
+            chunks
+                .iter()
+                .map(|c| scrub_sse_chunk(&guard.scrubber, c))
+                .collect::<Vec<_>>()
+        };
+        let payload = sse_marker_payload(stored_chunks);
+        record_node_and_advance(
+            &state,
+            &session,
+            &parent_id,
+            kind,
+            &scrubbed_req,
+            payload,
+            elapsed_ms,
+        );
+        let stream = stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<_, std::convert::Infallible>(Event::default().data(c))),
+        );
+        return Sse::new(stream).into_response();
+    }
+
+    if up.content_type.contains("application/json") {
+        let raw_json: Value = match serde_json::from_slice(&up.body) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": "CHRONOSTRACE_UPSTREAM_ERROR",
+                        "message": "upstream claimed JSON but the body did not parse"
+                    })),
+                )
+                    .into_response();
             }
-            (
-                StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                headers,
-                Json(body),
-            )
+        };
+        let scrubbed_resp = {
+            let guard = state.lock().expect("ProxyState mutex poisoned");
+            guard.scrubber.scrub_json(&raw_json)
+        };
+        record_node_and_advance(
+            &state,
+            &session,
+            &parent_id,
+            kind,
+            &scrubbed_req,
+            scrubbed_resp,
+            elapsed_ms,
+        );
+        // The client sees the upstream body verbatim; only the stored
+        // copy is scrubbed.
+        let status = StatusCode::from_u16(up.status).unwrap_or(StatusCode::OK);
+        return Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, up.content_type)
+            .body(Body::from(up.body))
+            .unwrap_or_else(|_| (status, Json(raw_json)).into_response());
+    }
+
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({
+            "error": "CHRONOSTRACE_UPSTREAM_ERROR",
+            "message": "upstream content type is neither JSON nor SSE; not recorded"
+        })),
+    )
+        .into_response()
+}
+
+fn record_node_and_advance(
+    state: &Arc<Mutex<ProxyState>>,
+    session: &Option<String>,
+    parent_id: &Option<String>,
+    kind: InteractionKind,
+    scrubbed_req: &Value,
+    response_payload: Value,
+    elapsed_ms: u64,
+) {
+    let mut guard = state.lock().expect("ProxyState mutex poisoned");
+    let prompt_text = extract_prompt_text(scrubbed_req);
+    let structural_tools = extract_structural_tools(scrubbed_req);
+    let node_id = guard.cassette.record_node(
+        parent_id.clone(),
+        kind,
+        &prompt_text,
+        &structural_tools,
+        scrubbed_req.clone(),
+        response_payload,
+        elapsed_ms,
+    );
+    match session {
+        Some(key) => {
+            guard.sessions.insert(key.clone(), Some(node_id));
+        }
+        None => {
+            guard.current_parent_id = Some(node_id);
         }
     }
 }
@@ -229,7 +516,28 @@ mod tests {
             sessions: HashMap::new(),
             scrubber: SecretScrubber::new(),
             chaos,
+            upstream: None,
         }))
+    }
+
+    async fn response_json(resp: Response) -> (StatusCode, HeaderMap, Value) {
+        let (parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        (
+            parts.status,
+            parts.headers,
+            serde_json::from_slice(&bytes).unwrap(),
+        )
+    }
+
+    async fn response_text(resp: Response) -> (StatusCode, HeaderMap, String) {
+        let (parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        (
+            parts.status,
+            parts.headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
     }
 
     #[tokio::test]
@@ -241,8 +549,10 @@ mod tests {
             "tools": [{"name": "verify_order"}]
         });
 
-        let (status, _, Json(body)) =
-            process_interaction(state.clone(), InteractionKind::LlmCompletion, None, req).await;
+        let (status, _, body) = response_json(
+            process_interaction(state.clone(), InteractionKind::LlmCompletion, None, req).await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["choices"][0]["message"]["content"], "Verified ORD-900");
         assert!(state.lock().unwrap().current_parent_id.is_some());
@@ -257,8 +567,10 @@ mod tests {
             "tools": [{"name": "verify_order"}]
         });
 
-        let (status, _, Json(body)) =
-            process_interaction(state, InteractionKind::LlmCompletion, None, mutated_req).await;
+        let (status, _, body) = response_json(
+            process_interaction(state, InteractionKind::LlmCompletion, None, mutated_req).await,
+        )
+        .await;
         assert_eq!(status, StatusCode::PRECONDITION_FAILED);
         assert_eq!(body["error"], "CHRONOSTRACE_REPLAY_MISS");
     }
@@ -280,8 +592,10 @@ mod tests {
             "tools": [{"name": "verify_order"}]
         });
 
-        let (status, headers, _) =
-            process_interaction(state.clone(), InteractionKind::LlmCompletion, None, req).await;
+        let (status, headers, _) = response_json(
+            process_interaction(state.clone(), InteractionKind::LlmCompletion, None, req).await,
+        )
+        .await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             headers.get(header::RETRY_AFTER).unwrap().to_str().unwrap(),
@@ -317,33 +631,42 @@ mod tests {
         };
 
         // Session A matches the root node and advances only its own pointer.
-        let (status, _, _) = process_interaction(
-            state.clone(),
-            InteractionKind::LlmCompletion,
-            Some("session-a".to_string()),
-            req(),
+        let (status, _, _) = response_json(
+            process_interaction(
+                state.clone(),
+                InteractionKind::LlmCompletion,
+                Some("session-a".to_string()),
+                req(),
+            )
+            .await,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
 
         // Session B replays the same trajectory independently: its parent
         // is still None, so it matches the root node again.
-        let (status, _, _) = process_interaction(
-            state.clone(),
-            InteractionKind::LlmCompletion,
-            Some("session-b".to_string()),
-            req(),
+        let (status, _, _) = response_json(
+            process_interaction(
+                state.clone(),
+                InteractionKind::LlmCompletion,
+                Some("session-b".to_string()),
+                req(),
+            )
+            .await,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
 
         // Session A replaying the same request again now misses: its parent
         // advanced past the root node, and no child was recorded.
-        let (status, _, _) = process_interaction(
-            state.clone(),
-            InteractionKind::LlmCompletion,
-            Some("session-a".to_string()),
-            req(),
+        let (status, _, _) = response_json(
+            process_interaction(
+                state.clone(),
+                InteractionKind::LlmCompletion,
+                Some("session-a".to_string()),
+                req(),
+            )
+            .await,
         )
         .await;
         assert_eq!(status, StatusCode::PRECONDITION_FAILED);
@@ -384,19 +707,208 @@ mod tests {
             sessions: HashMap::new(),
             scrubber: SecretScrubber::new(),
             chaos: None,
+            upstream: None,
         }));
-        let (status, _, _) = process_interaction(
-            state.clone(),
-            InteractionKind::McpToolCall,
-            None,
-            req_a.clone(),
+        let (status, _, _) = response_json(
+            process_interaction(
+                state.clone(),
+                InteractionKind::McpToolCall,
+                None,
+                req_a.clone(),
+            )
+            .await,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         let req_b = json!({"jsonrpc": "2.0", "method": "prompts/get", "params": {"name": "farewell", "arguments": {}}});
-        let (status, _, _) =
-            process_interaction(state, InteractionKind::McpToolCall, None, req_b).await;
+        let (status, _, _) = response_json(
+            process_interaction(state, InteractionKind::McpToolCall, None, req_b).await,
+        )
+        .await;
         assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    }
+
+    /// Fake upstream server for record-mode tests: a JSON echo endpoint
+    /// that requires a bearer token, an SSE endpoint, and a failing
+    /// endpoint. Returns its base URL; the server task lives until the
+    /// test runtime shuts down.
+    async fn fake_upstream() -> String {
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                    if headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        != Some("Bearer test-key")
+                    {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({"error": "unauthorized"})),
+                        );
+                    }
+                    (StatusCode::OK, Json(json!({"echo": body})))
+                }),
+            )
+            .route(
+                "/v1/stream",
+                post(|Json(_body): Json<Value>| async {
+                    let events = vec!["{\"delta\":\"hi\"}", "{\"delta\":\"there\"}", "[DONE]"];
+                    let stream = stream::iter(
+                        events
+                            .into_iter()
+                            .map(|c| Ok::<_, std::convert::Infallible>(Event::default().data(c))),
+                    );
+                    Sse::new(stream)
+                }),
+            )
+            .route(
+                "/v1/fail",
+                post(|Json(_body): Json<Value>| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "boom"})),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn record_state(base_url: String) -> Arc<Mutex<ProxyState>> {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        Arc::new(Mutex::new(ProxyState {
+            cassette: Cassette::new("record_test", 0.80),
+            current_parent_id: None,
+            sessions: HashMap::new(),
+            scrubber: SecretScrubber::new(),
+            chaos: None,
+            upstream: Some(UpstreamTarget { base_url, client }),
+        }))
+    }
+
+    #[tokio::test]
+    async fn record_mode_forwards_json_and_records_node() {
+        let base = fake_upstream().await;
+        let state = record_state(base);
+        let req = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
+        let (status, _, body) = response_json(
+            record_interaction(
+                state.clone(),
+                InteractionKind::LlmCompletion,
+                None,
+                "/v1/chat/completions",
+                Some("Bearer test-key".to_string()),
+                req,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["echo"]["model"], "gpt-4o");
+        let guard = state.lock().unwrap();
+        assert_eq!(guard.cassette.nodes.len(), 1);
+        assert!(guard.current_parent_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn record_mode_passes_through_errors_without_recording() {
+        let base = fake_upstream().await;
+        let state = record_state(base);
+        // Missing bearer token: the upstream 401 passes through, no node.
+        let req = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
+        let (status, _, body) = response_json(
+            record_interaction(
+                state.clone(),
+                InteractionKind::LlmCompletion,
+                None,
+                "/v1/chat/completions",
+                None,
+                req,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "unauthorized");
+        // Upstream 500: same treatment.
+        let (status, _, _) = response_json(
+            record_interaction(
+                state.clone(),
+                InteractionKind::LlmCompletion,
+                None,
+                "/v1/fail",
+                Some("Bearer test-key".to_string()),
+                json!({}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.lock().unwrap().cassette.nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_mode_records_sse_chunks_and_replays_as_event_stream() {
+        let base = fake_upstream().await;
+        let state = record_state(base);
+        let req = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}], "stream": true});
+        let (status, headers, text) = response_text(
+            record_interaction(
+                state.clone(),
+                InteractionKind::LlmCompletion,
+                None,
+                "/v1/stream",
+                Some("Bearer test-key".to_string()),
+                req.clone(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("text/event-stream"));
+        assert!(text.contains("data: {\"delta\":\"hi\"}"));
+        assert!(text.contains("data: [DONE]"));
+        // The stored node carries the SSE marker, not the raw stream.
+        {
+            let guard = state.lock().unwrap();
+            assert_eq!(guard.cassette.nodes.len(), 1);
+            let chunks =
+                sse_chunks_from_payload(&guard.cassette.nodes[0].response_payload).unwrap();
+            assert_eq!(
+                chunks,
+                vec!["{\"delta\":\"hi\"}", "{\"delta\":\"there\"}", "[DONE]"]
+            );
+        }
+        // Replay the same request (now in replay mode) streams the events
+        // back instead of returning JSON.
+        {
+            let mut guard = state.lock().unwrap();
+            guard.upstream = None;
+            guard.current_parent_id = None;
+        }
+        let (status, headers, text) = response_text(
+            process_interaction(state.clone(), InteractionKind::LlmCompletion, None, req).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("text/event-stream"));
+        assert!(text.contains("data: {\"delta\":\"there\"}"));
+        assert!(text.contains("data: [DONE]"));
     }
 
     #[test]
