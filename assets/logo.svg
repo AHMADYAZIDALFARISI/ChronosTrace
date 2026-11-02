@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="160" height="160" fill="none">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="240" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0B1120"/>
+      <stop offset="100%" stop-color="#1E293B"/>
+    </linearGradient>
+    <linearGradient id="cyanGrad" x1="40" y1="40" x2="200" y2="200" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="amberGrad" x1="120" y1="60" x2="190" y2="140" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F59E0B"/>
+      <stop offset="100%" stop-color="#EA580C"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background Squircle -->
+  <rect x="12" y="12" width="216" height="216" rx="48" fill="url(#bgGrad)" stroke="#334155" stroke-width="4"/>
+
+  <!-- Outer Chronometer Ring -->
+  <circle cx="120" cy="124" r="76" stroke="url(#cyanGrad)" stroke-width="6" stroke-dasharray="14 8" opacity="0.85"/>
+  <circle cx="120" cy="124" r="64" stroke="#475569" stroke-width="2" opacity="0.6"/>
+
+  <!-- Top Stopwatch Crown -->
+  <rect x="106" y="26" width="28" height="10" rx="4" fill="#38BDF8"/>
+  <path d="M120 36V48" stroke="#38BDF8" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- DAG Trajectory Edges -->
+  <path d="M84 152L120 92L160 116" stroke="url(#cyanGrad)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M120 92L154 152" stroke="url(#amberGrad)" stroke-width="5" stroke-linecap="round" stroke-dasharray="6 6"/>
+  <path d="M84 152L154 152" stroke="#64748B" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- DAG Nodes -->
+  <circle cx="120" cy="92" r="11" fill="#0B1120" stroke="#38BDF8" stroke-width="5"/>
+  <circle cx="84" cy="152" r="10" fill="#0B1120" stroke="#06B6D4" stroke-width="5"/>
+  <circle cx="160" cy="116" r="10" fill="#0B1120" stroke="#38BDF8" stroke-width="5"/>
+  <circle cx="154" cy="152" r="10" fill="#0B1120" stroke="#F59E0B" stroke-width="5"/>
+
+  <!-- Center Pulse Dot -->
+  <circle cx="120" cy="92" r="4" fill="#38BDF8"/>
+</svg>

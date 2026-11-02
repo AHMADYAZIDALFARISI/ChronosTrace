@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="./assets/logo.svg" alt="ChronosTrace Logo" width="140" height="140" />
+</div>
+
 # ChronosTrace
 
 Deterministic VCR replay, graph-aware trajectory diffing, and chaos fault
