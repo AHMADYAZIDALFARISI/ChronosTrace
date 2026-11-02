@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./assets/logo.svg" alt="ChronosTrace Logo" width="140" height="140" />
+  <img src="./assets/logo.png" alt="ChronosTrace Logo" width="140" height="140" />
 </div>
 
 # ChronosTrace
