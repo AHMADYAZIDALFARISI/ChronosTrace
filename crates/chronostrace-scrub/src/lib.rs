@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub const SCRUBBER_POLICY_VERSION: &str = "1.1.0-entropy-regex";
+pub const SCRUBBER_POLICY_VERSION: &str = "1.2.0-entropy-regex-jwt";
 
 pub struct SecretScrubber {
     patterns: Vec<(Regex, &'static str)>,
@@ -20,6 +20,12 @@ impl Default for SecretScrubber {
 impl SecretScrubber {
     pub fn new() -> Self {
         let patterns = vec![
+            // Anthropic keys first: the generic sk- pattern below would
+            // otherwise swallow them under the LLM label.
+            (
+                Regex::new(r"sk-ant-[a-zA-Z0-9_\-]{20,}").unwrap(),
+                "[REDACTED_ANTHROPIC_KEY]",
+            ),
             (
                 Regex::new(r"sk-[a-zA-Z0-9_\-]{20,}").unwrap(),
                 "[REDACTED_LLM_KEY]",
@@ -43,12 +49,28 @@ impl SecretScrubber {
                 .unwrap(),
                 "[REDACTED_PRIVATE_KEY]",
             ),
+            // Explicit JWT shape (header.payload.signature, base64url).
+            // Previously a JWT was caught only incidentally by the
+            // entropy fallback when it appeared as a standalone token.
+            (
+                Regex::new(r"eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+").unwrap(),
+                "[REDACTED_JWT]",
+            ),
         ];
         Self {
             patterns,
             entropy_threshold: 4.25,
             redaction_counter: AtomicUsize::new(0),
         }
+    }
+
+    /// Append caller-supplied redaction patterns (replacement
+    /// `[REDACTED_CUSTOM]`). Applied after the built-in patterns.
+    pub fn with_extra_patterns(mut self, patterns: &[Regex]) -> Self {
+        for pattern in patterns {
+            self.patterns.push((pattern.clone(), "[REDACTED_CUSTOM]"));
+        }
+        self
     }
 
     pub fn policy_version(&self) -> &'static str {
@@ -65,6 +87,14 @@ impl SecretScrubber {
                 let mut cleaned = serde_json::Map::new();
                 for (k, v) in map {
                     let lower_k = k.to_ascii_lowercase();
+                    // Token keys: exact `token`, `*_token` (refresh_token,
+                    // id_token, access_token), `token_*`. Deliberately NOT
+                    // a bare substring match: `max_tokens` and
+                    // `tokens_used` are usage counts, not secrets, and
+                    // must survive scrubbing.
+                    let is_token_key = lower_k == "token"
+                        || lower_k.ends_with("_token")
+                        || lower_k.starts_with("token_");
                     if lower_k.contains("api_key")
                         || lower_k.contains("apikey")
                         || lower_k == "authorization"
@@ -73,8 +103,9 @@ impl SecretScrubber {
                         || lower_k == "set-cookie"
                         || lower_k.contains("secret")
                         || lower_k.contains("password")
-                        || lower_k.contains("access_token")
-                        || lower_k.contains("client_secret")
+                        || lower_k.contains("passwd")
+                        || lower_k.contains("pwd")
+                        || is_token_key
                     {
                         self.redaction_counter.fetch_add(1, Ordering::Relaxed);
                         cleaned.insert(
@@ -162,5 +193,111 @@ mod tests {
         assert!(!serialized.contains("ghp_12345"));
         assert!(!serialized.contains("aB3$kL9!"));
         assert!(scrubber.total_redactions() >= 4);
+    }
+
+    // CT-HARDEN-009: token-key rules. Exact `token`, `*_token`, and
+    // `token_*` redact; usage counts must NOT.
+    #[test]
+    fn token_key_rules_redact_tokens_but_not_usage_counts() {
+        let scrubber = SecretScrubber::new();
+        let payload = json!({
+            "token": "tok-secret-value",
+            "refresh_token": "refresh-secret-value",
+            "id_token": "id-secret-value",
+            "my_token": "my-secret-value",
+            "token_value": "token-secret-value",
+            "access_token": "access-secret-value",
+            "max_tokens": 4096,
+            "tokens_used": 123,
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20}
+        });
+        let scrubbed = scrubber.scrub_json(&payload);
+        for key in [
+            "token",
+            "refresh_token",
+            "id_token",
+            "my_token",
+            "token_value",
+            "access_token",
+        ] {
+            assert_eq!(
+                scrubbed[key], "[REDACTED_SENSITIVE_FIELD]",
+                "{key} must be redacted"
+            );
+        }
+        assert_eq!(scrubbed["max_tokens"], 4096);
+        assert_eq!(scrubbed["tokens_used"], 123);
+        assert_eq!(scrubbed["usage"]["prompt_tokens"], 10);
+        assert_eq!(scrubbed["usage"]["completion_tokens"], 20);
+    }
+
+    // CT-HARDEN-009: passwd/pwd keys redact alongside password.
+    #[test]
+    fn passwd_and_pwd_keys_redact() {
+        let scrubber = SecretScrubber::new();
+        let payload = json!({
+            "password": "pw-secret",
+            "passwd": "passwd-secret",
+            "pwd": "pwd-secret",
+            "db_pwd_hash": "hash-secret"
+        });
+        let scrubbed = scrubber.scrub_json(&payload);
+        for key in ["password", "passwd", "pwd", "db_pwd_hash"] {
+            assert_eq!(scrubbed[key], "[REDACTED_SENSITIVE_FIELD]");
+        }
+    }
+
+    // CT-HARDEN-009: explicit JWT shape (jwt.io public example token,
+    // not a real credential) and explicit Anthropic key label.
+    #[test]
+    fn jwt_pattern_and_anthropic_label() {
+        let scrubber = SecretScrubber::new();
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let scrubbed = scrubber.scrub_str(&format!("auth {jwt} end"));
+        assert!(!scrubbed.contains("eyJhbGciOi"));
+        assert!(scrubbed.contains("[REDACTED_JWT]"));
+        let scrubbed = scrubber.scrub_str("key sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA end");
+        assert!(scrubbed.contains("[REDACTED_ANTHROPIC_KEY]"));
+        assert!(!scrubbed.contains("sk-ant-api03"));
+        // A generic sk- key still gets the LLM label, not the Anthropic one.
+        let scrubbed = scrubber.scrub_str("key sk-AAAAAAAAAAAAAAAAAAAAAAAA end");
+        assert!(scrubbed.contains("[REDACTED_LLM_KEY]"));
+    }
+
+    // CT-HARDEN-009: private-key blocks (multiline values) redact.
+    #[test]
+    fn private_key_block_redacts() {
+        let scrubber = SecretScrubber::new();
+        let block =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEFAKEKEYDATA\n-----END RSA PRIVATE KEY-----";
+        let scrubbed = scrubber.scrub_str(&format!("cert:\n{block}\ndone"));
+        assert!(scrubbed.contains("[REDACTED_PRIVATE_KEY]"));
+        assert!(!scrubbed.contains("MIIEFAKEKEYDATA"));
+        // Nested JSON: the block inside an object field redacts too.
+        let payload = json!({"nested": {"key_material": block}});
+        let scrubbed = scrubber.scrub_json(&payload);
+        assert!(!scrubbed.to_string().contains("MIIEFAKEKEYDATA"));
+    }
+
+    // CT-HARDEN-009: caller-supplied custom patterns.
+    #[test]
+    fn custom_patterns_redact_with_custom_label() {
+        let scrubber =
+            SecretScrubber::new().with_extra_patterns(&[Regex::new(r"INTERNAL-[0-9]+").unwrap()]);
+        let scrubbed = scrubber.scrub_str("ref INTERNAL-4242 and plain text");
+        assert!(scrubbed.contains("[REDACTED_CUSTOM]"));
+        assert!(!scrubbed.contains("INTERNAL-4242"));
+        assert!(scrubbed.contains("plain text"));
+    }
+
+    // CT-HARDEN-009 documented limits, pinned as behavior: a short
+    // low-entropy secret in an unkeyed field is NOT detectable without
+    // unacceptable false positives, so it survives.
+    #[test]
+    fn short_low_entropy_unkeyed_secret_survives_by_design() {
+        let scrubber = SecretScrubber::new();
+        let payload = json!({"note": "the code is abc123"});
+        let scrubbed = scrubber.scrub_json(&payload);
+        assert_eq!(scrubbed["note"], "the code is abc123");
     }
 }

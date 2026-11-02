@@ -121,7 +121,7 @@ export async function withChronosTrace<T>(
 
   const args = ["replay", "--cassette", cassettePath, "--bind", bindAddr];
   if (typeof options.chaosRateLimitProb === "number") {
-    args.push("--chaos-rate-limit-prob", String(options.chaosRateLimitProb));
+    args.push("--chaos-profile", "http-429", "--chaos-probability", String(options.chaosRateLimitProb));
   }
 
   const child = spawn(bin, args, {
@@ -238,7 +238,7 @@ export class McpStdioTestClient {
       args.push("--simulate-latency");
     }
     if (typeof this.options.chaosServiceOutageProb === "number") {
-      args.push("--chaos-service-outage-prob", String(this.options.chaosServiceOutageProb));
+      args.push("--chaos-profile", "service-503", "--chaos-probability", String(this.options.chaosServiceOutageProb));
     }
     if (this.options.childCommand && this.options.childCommand.length > 0) {
       args.push("--", ...this.options.childCommand);

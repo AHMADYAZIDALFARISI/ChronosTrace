@@ -94,6 +94,16 @@ pub struct TraceNode {
     pub request_payload: Value,
     pub response_payload: Value,
     pub recorded_latency_ms: u64,
+    /// HTTP status the upstream returned when this node was recorded.
+    /// Absent for nodes recorded before status capture (and for MCP
+    /// nodes, which have no HTTP status); replay defaults those to 200.
+    #[serde(default)]
+    pub response_status: Option<u16>,
+    /// Safe upstream response headers captured with the node
+    /// (content-type, retry-after, x-request-id only — never cookies
+    /// or authorization material). Absent means "no headers recorded".
+    #[serde(default)]
+    pub response_headers: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +253,35 @@ impl Cassette {
         response_payload: Value,
         recorded_latency_ms: u64,
     ) -> String {
+        self.record_node_full(
+            parent_id,
+            kind,
+            prompt_text,
+            structural_tool_payload,
+            request_payload,
+            response_payload,
+            recorded_latency_ms,
+            None,
+            None,
+        )
+    }
+
+    /// Full node recording, including the HTTP status and safe
+    /// response headers for HTTP nodes. MCP nodes and legacy callers
+    /// pass `None` for both and replay as 200 with no extra headers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_node_full(
+        &mut self,
+        parent_id: Option<String>,
+        kind: InteractionKind,
+        prompt_text: &str,
+        structural_tool_payload: &Value,
+        request_payload: Value,
+        response_payload: Value,
+        recorded_latency_ms: u64,
+        response_status: Option<u16>,
+        response_headers: Option<BTreeMap<String, String>>,
+    ) -> String {
         let exact_request_hash = sha256_canonical_json(&request_payload);
         let structural_tool_hash = sha256_canonical_json(structural_tool_payload);
         let safety_critical_hash = compute_safety_critical_hash(&request_payload);
@@ -266,6 +305,8 @@ impl Cassette {
             request_payload,
             response_payload,
             recorded_latency_ms,
+            response_status,
+            response_headers,
         });
 
         node_id

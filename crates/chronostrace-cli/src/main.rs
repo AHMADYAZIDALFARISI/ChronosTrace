@@ -4,7 +4,7 @@ use chronostrace_chaos::{ChaosEngine, ChaosProfile, FaultKind};
 use chronostrace_core::diff::{diff_cassettes, TrajectoryDiffReport};
 use chronostrace_core::Cassette;
 use chronostrace_proxy::mcp_stdio::{run_mcp_stdio_wrapper, McpStdioConfig, McpWrapMode};
-use chronostrace_proxy::{build_router, ProxyState, UpstreamTarget};
+use chronostrace_proxy::{build_router, ProxyState, SessionLocks, UpstreamTarget};
 use chronostrace_scrub::SecretScrubber;
 use clap::{Parser, Subcommand, ValueEnum};
 use diff_render::{render_markdown_diff, render_terminal_diff};
@@ -36,6 +36,140 @@ enum WrapModeArg {
     Passthrough,
 }
 
+/// Chaos fault profiles, shared by `replay` (HTTP) and `mcp-wrap`
+/// (stdio frames). One profile per invocation; the engine is
+/// deterministic for a given seed.
+#[derive(Clone, ValueEnum, PartialEq, Eq)]
+enum ChaosProfileArg {
+    #[value(name = "http-429")]
+    Http429,
+    #[value(name = "latency")]
+    Latency,
+    #[value(name = "truncated")]
+    Truncated,
+    #[value(name = "drop-field")]
+    DropField,
+    #[value(name = "service-503")]
+    Service503,
+}
+
+impl ChaosProfileArg {
+    fn name(&self) -> &'static str {
+        match self {
+            ChaosProfileArg::Http429 => "http-429",
+            ChaosProfileArg::Latency => "latency",
+            ChaosProfileArg::Truncated => "truncated",
+            ChaosProfileArg::DropField => "drop-field",
+            ChaosProfileArg::Service503 => "service-503",
+        }
+    }
+}
+
+/// Chaos flags, flattened into both `replay` and `mcp-wrap` so the two
+/// transports expose exactly the same surface. `--chaos-delay-ms`,
+/// `--chaos-keep-ratio`, and `--chaos-field` are `Option` (not
+/// defaulted) so passing one with a profile it does not belong to is
+/// a hard error instead of a silently ignored value.
+#[derive(clap::Args)]
+struct ChaosArgs {
+    #[arg(long)]
+    chaos_profile: Option<ChaosProfileArg>,
+    #[arg(long)]
+    chaos_probability: Option<f64>,
+    #[arg(long, default_value_t = 42)]
+    chaos_seed: u64,
+    #[arg(long)]
+    chaos_field: Option<String>,
+    #[arg(long)]
+    chaos_delay_ms: Option<u64>,
+    #[arg(long)]
+    chaos_keep_ratio: Option<f32>,
+}
+
+/// Custom redaction patterns, flattened into `replay`, `mcp-wrap`,
+/// and `verify`. Repeatable; an invalid regex is a hard CLI error,
+/// never silently ignored.
+#[derive(clap::Args)]
+struct RedactArgs {
+    #[arg(long)]
+    redact_regex: Vec<String>,
+}
+
+/// Parse `--redact-regex` values, or fail fast on the first invalid one.
+fn parse_redact_patterns(args: &RedactArgs) -> Result<Vec<regex::Regex>, String> {
+    let mut out = Vec::new();
+    for pattern in &args.redact_regex {
+        out.push(
+            regex::Regex::new(pattern)
+                .map_err(|e| format!("invalid --redact-regex {pattern:?}: {e}"))?,
+        );
+    }
+    Ok(out)
+}
+
+/// The scrubber for a command: built-ins plus the caller's custom
+/// patterns.
+fn build_scrubber(args: &RedactArgs) -> Result<SecretScrubber, String> {
+    Ok(SecretScrubber::new().with_extra_patterns(&parse_redact_patterns(args)?))
+}
+fn build_chaos(args: &ChaosArgs) -> Result<Option<ChaosEngine>, String> {
+    let (profile, probability) = match (&args.chaos_profile, args.chaos_probability) {
+        (None, None) => return Ok(None),
+        (None, Some(_)) => {
+            return Err("--chaos-probability requires --chaos-profile".to_string());
+        }
+        (Some(_), None) => {
+            return Err("--chaos-profile requires --chaos-probability".to_string());
+        }
+        (Some(p), Some(prob)) => (p.clone(), prob),
+    };
+    if !(0.0..=1.0).contains(&probability) {
+        return Err(format!(
+            "--chaos-probability must be between 0.0 and 1.0 (got {probability})"
+        ));
+    }
+    if args.chaos_delay_ms.is_some() && profile != ChaosProfileArg::Latency {
+        return Err("--chaos-delay-ms only applies to --chaos-profile latency".to_string());
+    }
+    if args.chaos_keep_ratio.is_some() && profile != ChaosProfileArg::Truncated {
+        return Err("--chaos-keep-ratio only applies to --chaos-profile truncated".to_string());
+    }
+    if args.chaos_field.is_some() && profile != ChaosProfileArg::DropField {
+        return Err("--chaos-field only applies to --chaos-profile drop-field".to_string());
+    }
+    if let Some(ratio) = args.chaos_keep_ratio {
+        if !(0.0..=1.0).contains(&ratio) || ratio == 0.0 {
+            return Err(format!(
+                "--chaos-keep-ratio must be between 0.0 (exclusive) and 1.0 (got {ratio})"
+            ));
+        }
+    }
+    let fault = match &profile {
+        ChaosProfileArg::Http429 => FaultKind::Http429RateLimit {
+            retry_after_secs: 60,
+        },
+        ChaosProfileArg::Latency => FaultKind::LatencySpike {
+            delay_ms: args.chaos_delay_ms.unwrap_or(500),
+        },
+        ChaosProfileArg::Truncated => FaultKind::TruncatedJsonPayload {
+            keep_ratio: args.chaos_keep_ratio.unwrap_or(0.5),
+        },
+        ChaosProfileArg::DropField => FaultKind::DropSchemaField {
+            field_name: args
+                .chaos_field
+                .clone()
+                .ok_or("--chaos-profile drop-field requires --chaos-field <NAME>".to_string())?,
+        },
+        ChaosProfileArg::Service503 => FaultKind::ServiceUnavailable503,
+    };
+    Ok(Some(ChaosEngine::new(ChaosProfile {
+        name: format!("cli_{}", profile.name()),
+        seed: args.chaos_seed,
+        probability,
+        fault,
+    })))
+}
+
 #[derive(Clone, ValueEnum)]
 enum DiffFormatArg {
     Terminal,
@@ -50,8 +184,10 @@ enum Commands {
         cassette: PathBuf,
         #[arg(short, long, default_value = "127.0.0.1:8787")]
         bind: String,
-        #[arg(long)]
-        chaos_rate_limit_prob: Option<f64>,
+        #[command(flatten)]
+        chaos: ChaosArgs,
+        #[command(flatten)]
+        redact: RedactArgs,
         /// Replay recorded responses (default), or forward to a live
         /// upstream and record the scrubbed traffic into the cassette.
         #[arg(short, long, value_enum, default_value_t = ReplayModeArg::Replay)]
@@ -73,8 +209,10 @@ enum Commands {
         similarity_threshold: f64,
         #[arg(long, default_value_t = false)]
         simulate_latency: bool,
-        #[arg(long)]
-        chaos_service_outage_prob: Option<f64>,
+        #[command(flatten)]
+        chaos: ChaosArgs,
+        #[command(flatten)]
+        redact: RedactArgs,
         #[arg(last = true)]
         child_command: Vec<String>,
     },
@@ -101,6 +239,8 @@ enum Commands {
         /// secret-pattern or high-entropy hits that remain.
         #[arg(long, default_value_t = false)]
         rescan: bool,
+        #[command(flatten)]
+        redact: RedactArgs,
     },
 }
 
@@ -127,7 +267,8 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Commands::Replay {
             cassette,
             bind,
-            chaos_rate_limit_prob,
+            chaos,
+            redact,
             mode,
             upstream,
             similarity_threshold,
@@ -160,24 +301,17 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 None
             };
 
-            let chaos = chaos_rate_limit_prob.map(|prob| {
-                ChaosEngine::new(ChaosProfile {
-                    name: "cli_rate_limit".into(),
-                    seed: 42,
-                    probability: prob,
-                    fault: FaultKind::Http429RateLimit {
-                        retry_after_secs: 1,
-                    },
-                })
-            });
+            let chaos = build_chaos(&chaos).map_err(|e| format!("chaos config: {e}"))?;
+            let scrubber = build_scrubber(&redact).map_err(|e| format!("redact config: {e}"))?;
 
             let state = Arc::new(Mutex::new(ProxyState {
                 cassette: loaded,
                 current_parent_id: initial_parent,
                 sessions: std::collections::HashMap::new(),
-                scrubber: SecretScrubber::new(),
+                scrubber,
                 chaos,
                 upstream: upstream_target,
+                session_locks: SessionLocks::default(),
             }));
 
             let state_for_save = state.clone();
@@ -214,7 +348,8 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             mode,
             similarity_threshold,
             simulate_latency,
-            chaos_service_outage_prob,
+            chaos,
+            redact,
             child_command,
         } => {
             let wrap_mode = match mode {
@@ -223,14 +358,9 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 WrapModeArg::Passthrough => McpWrapMode::PassthroughOnMiss,
             };
 
-            let chaos = chaos_service_outage_prob.map(|prob| {
-                ChaosEngine::new(ChaosProfile {
-                    name: "mcp_outage".into(),
-                    seed: 1337,
-                    probability: prob,
-                    fault: FaultKind::ServiceUnavailable503,
-                })
-            });
+            let chaos = build_chaos(&chaos).map_err(|e| format!("chaos config: {e}"))?;
+            let extra_patterns =
+                parse_redact_patterns(&redact).map_err(|e| format!("redact config: {e}"))?;
 
             let cfg = McpStdioConfig {
                 mode: wrap_mode,
@@ -238,11 +368,26 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 similarity_threshold,
                 simulate_recorded_latency: simulate_latency,
                 chaos,
+                extra_patterns,
                 child_command,
             };
 
-            run_mcp_stdio_wrapper(cfg).await?;
-            Ok(ExitCode::SUCCESS)
+            // The wrapper returns Err for child-death, signal interrupt,
+            // and I/O failures. Do NOT propagate it with `?`: tokio's
+            // stdin blocking-read thread never finishes while the host
+            // keeps stdin open, and the runtime's shutdown waits for it,
+            // so a `?` return would hang the process after the error was
+            // already reported (reproduced: error printed, process alive
+            // 20 s+ until stdin closed). The cassette is already flushed
+            // and persisted and the child already reaped before the
+            // wrapper returns, so exiting directly here loses nothing.
+            match run_mcp_stdio_wrapper(cfg).await {
+                Ok(()) => Ok(ExitCode::SUCCESS),
+                Err(e) => {
+                    eprintln!("Error: {e:?}");
+                    std::process::exit(1);
+                }
+            }
         }
 
         Commands::Diff {
@@ -264,8 +409,16 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             Ok(ExitCode::from(diff_exit_code(&report, fail_on_divergence)))
         }
 
-        Commands::Verify { cassette, rescan } => {
+        Commands::Verify {
+            cassette,
+            rescan,
+            redact,
+        } => {
             let loaded = Cassette::load_from_file(&cassette)?;
+            // Validate custom patterns eagerly: an invalid regex is a
+            // hard error even when --rescan is off (the flag would
+            // otherwise be silently meaningless).
+            let scrubber = build_scrubber(&redact).map_err(|e| format!("redact config: {e}"))?;
             println!(
                 "Verified cassette '{}' (v{}): {} DAG nodes, threshold >= {:.2}, scrub metadata flag={}",
                 loaded.cassette_id,
@@ -284,7 +437,6 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             // payload and report anything it still flags. A clean rescan
             // is not proof that no secret is present: pattern and entropy
             // matching cannot guarantee full discovery.
-            let scrubber = SecretScrubber::new();
             let mut flagged: Vec<(String, usize)> = Vec::new();
             let mut total_hits = 0usize;
             for node in &loaded.nodes {
@@ -395,14 +547,17 @@ mod tests {
             Commands::Replay {
                 cassette,
                 bind,
-                chaos_rate_limit_prob,
+                chaos,
+                redact,
                 mode,
                 upstream,
                 similarity_threshold,
             } => {
                 assert_eq!(cassette, PathBuf::from("a.ctrace"));
                 assert_eq!(bind, "127.0.0.1:8787");
-                assert!(chaos_rate_limit_prob.is_none());
+                assert!(chaos.chaos_profile.is_none());
+                assert!(chaos.chaos_probability.is_none());
+                assert!(redact.redact_regex.is_empty());
                 assert!(matches!(mode, ReplayModeArg::Replay));
                 assert!(upstream.is_none());
                 assert_eq!(similarity_threshold, 0.85);
@@ -438,14 +593,15 @@ mod tests {
                 mode,
                 similarity_threshold,
                 simulate_latency,
-                chaos_service_outage_prob,
+                chaos,
                 child_command,
                 ..
             } => {
                 assert!(matches!(mode, WrapModeArg::Replay));
                 assert_eq!(similarity_threshold, 0.85);
                 assert!(!simulate_latency);
-                assert!(chaos_service_outage_prob.is_none());
+                assert!(chaos.chaos_profile.is_none());
+                assert!(chaos.chaos_probability.is_none());
                 assert!(child_command.is_empty());
             }
             _ => panic!("expected McpWrap"),
@@ -464,6 +620,181 @@ mod tests {
             Commands::McpWrap { mode, .. } => assert!(matches!(mode, WrapModeArg::Passthrough)),
             _ => panic!("expected McpWrap"),
         }
+    }
+
+    fn chaos_args(
+        profile: Option<ChaosProfileArg>,
+        probability: Option<f64>,
+        field: Option<&str>,
+        delay_ms: Option<u64>,
+        keep_ratio: Option<f32>,
+    ) -> ChaosArgs {
+        ChaosArgs {
+            chaos_profile: profile,
+            chaos_probability: probability,
+            chaos_seed: 42,
+            chaos_field: field.map(str::to_string),
+            chaos_delay_ms: delay_ms,
+            chaos_keep_ratio: keep_ratio,
+        }
+    }
+
+    // CT-HARDEN-008: the unified chaos surface parses on both commands
+    // and invalid combinations fail fast in build_chaos.
+    #[test]
+    fn cli_parses_unified_chaos_flags() {
+        let cli = Cli::try_parse_from([
+            "chronostrace",
+            "replay",
+            "--cassette",
+            "a.ctrace",
+            "--chaos-profile",
+            "drop-field",
+            "--chaos-probability",
+            "0.5",
+            "--chaos-field",
+            "result",
+            "--chaos-seed",
+            "7",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Replay { chaos, .. } => {
+                assert!(matches!(
+                    chaos.chaos_profile,
+                    Some(ChaosProfileArg::DropField)
+                ));
+                assert_eq!(chaos.chaos_probability, Some(0.5));
+                assert_eq!(chaos.chaos_field.as_deref(), Some("result"));
+                assert_eq!(chaos.chaos_seed, 7);
+                assert!(build_chaos(&chaos).is_ok());
+            }
+            _ => panic!("expected Replay"),
+        }
+        // Old single-purpose flags are gone.
+        assert!(Cli::try_parse_from([
+            "chronostrace",
+            "replay",
+            "--cassette",
+            "a.ctrace",
+            "--chaos-rate-limit-prob",
+            "0.5",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "chronostrace",
+            "mcp-wrap",
+            "-c",
+            "x.ctrace",
+            "--chaos-service-outage-prob",
+            "0.5",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn build_chaos_rejects_invalid_combinations() {
+        // Neither flag: no chaos.
+        assert!(build_chaos(&chaos_args(None, None, None, None, None))
+            .unwrap()
+            .is_none());
+        // Profile without probability, and vice versa.
+        assert!(build_chaos(&chaos_args(
+            Some(ChaosProfileArg::Http429),
+            None,
+            None,
+            None,
+            None
+        ))
+        .is_err());
+        assert!(build_chaos(&chaos_args(None, Some(0.5), None, None, None)).is_err());
+        // Probability out of range.
+        assert!(build_chaos(&chaos_args(
+            Some(ChaosProfileArg::Http429),
+            Some(1.5),
+            None,
+            None,
+            None
+        ))
+        .is_err());
+        // drop-field requires its field.
+        assert!(build_chaos(&chaos_args(
+            Some(ChaosProfileArg::DropField),
+            Some(1.0),
+            None,
+            None,
+            None
+        ))
+        .is_err());
+        // Per-profile options on the wrong profile are errors, not
+        // silently ignored values.
+        assert!(build_chaos(&chaos_args(
+            Some(ChaosProfileArg::Http429),
+            Some(1.0),
+            Some("x"),
+            None,
+            None
+        ))
+        .is_err());
+        assert!(build_chaos(&chaos_args(
+            Some(ChaosProfileArg::Latency),
+            Some(1.0),
+            None,
+            None,
+            Some(0.5)
+        ))
+        .is_err());
+        assert!(build_chaos(&chaos_args(
+            Some(ChaosProfileArg::Http429),
+            Some(1.0),
+            None,
+            Some(100),
+            None
+        ))
+        .is_err());
+        assert!(build_chaos(&chaos_args(
+            Some(ChaosProfileArg::Truncated),
+            Some(1.0),
+            None,
+            None,
+            Some(0.0)
+        ))
+        .is_err());
+        // Matching per-profile options build fine (with defaults when
+        // omitted, and with explicit values when given).
+        assert!(build_chaos(&chaos_args(
+            Some(ChaosProfileArg::Latency),
+            Some(1.0),
+            None,
+            Some(100),
+            None
+        ))
+        .is_ok());
+        assert!(build_chaos(&chaos_args(
+            Some(ChaosProfileArg::Truncated),
+            Some(1.0),
+            None,
+            None,
+            Some(0.25)
+        ))
+        .is_ok());
+        // Every profile builds at probability 1.0.
+        for profile in [
+            ChaosProfileArg::Http429,
+            ChaosProfileArg::Latency,
+            ChaosProfileArg::Truncated,
+            ChaosProfileArg::Service503,
+        ] {
+            assert!(build_chaos(&chaos_args(Some(profile), Some(1.0), None, None, None)).is_ok());
+        }
+        assert!(build_chaos(&chaos_args(
+            Some(ChaosProfileArg::DropField),
+            Some(1.0),
+            Some("result"),
+            None,
+            None
+        ))
+        .is_ok());
     }
 
     #[test]
@@ -577,6 +908,9 @@ mod tests {
             command: Commands::Verify {
                 cassette: p_base.clone(),
                 rescan: false,
+                redact: RedactArgs {
+                    redact_regex: vec![],
+                },
             },
         })
         .await;
@@ -587,6 +921,9 @@ mod tests {
                 cassette: std::env::temp_dir()
                     .join("chronostrace-cli-test-definitely-missing.ctrace"),
                 rescan: false,
+                redact: RedactArgs {
+                    redact_regex: vec![],
+                },
             },
         })
         .await;
@@ -621,6 +958,9 @@ mod tests {
             command: Commands::Verify {
                 cassette: p_planted.clone(),
                 rescan: false,
+                redact: RedactArgs {
+                    redact_regex: vec![],
+                },
             },
         })
         .await;
@@ -631,6 +971,9 @@ mod tests {
             command: Commands::Verify {
                 cassette: p_planted.clone(),
                 rescan: true,
+                redact: RedactArgs {
+                    redact_regex: vec![],
+                },
             },
         })
         .await;
@@ -643,12 +986,65 @@ mod tests {
             command: Commands::Verify {
                 cassette: p_clean.clone(),
                 rescan: true,
+                redact: RedactArgs {
+                    redact_regex: vec![],
+                },
             },
         })
         .await;
         assert_eq!(res.unwrap(), ExitCode::SUCCESS);
 
         std::fs::remove_file(&p_planted).ok();
+        std::fs::remove_file(&p_clean).ok();
+    }
+
+    // CT-HARDEN-009: --redact-regex parses (repeatable) and an invalid
+    // regex is a hard error before any serving or scanning happens.
+    #[test]
+    fn redact_regex_parses_and_rejects_invalid() {
+        let args = RedactArgs {
+            redact_regex: vec!["INTERNAL-[0-9]+".to_string(), "SECRET-[A-Z]+".to_string()],
+        };
+        assert_eq!(parse_redact_patterns(&args).unwrap().len(), 2);
+        let bad = RedactArgs {
+            redact_regex: vec!["[".to_string()],
+        };
+        assert!(parse_redact_patterns(&bad).is_err());
+        // The flag is accepted on all three commands that take it.
+        let cli = Cli::try_parse_from([
+            "chronostrace",
+            "replay",
+            "--cassette",
+            "a.ctrace",
+            "--redact-regex",
+            "INTERNAL-[0-9]+",
+            "--redact-regex",
+            "SECRET-[A-Z]+",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Replay { redact, .. } => {
+                assert_eq!(redact.redact_regex.len(), 2);
+            }
+            _ => panic!("expected Replay"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_cli_verify_rejects_invalid_redact_regex() {
+        let clean = fixture_cassette("ok", "You are a helpful refund agent.", json!({"ok": true}));
+        let p_clean = write_cassette("redact_bad", &clean);
+        let res = execute_cli(Cli {
+            command: Commands::Verify {
+                cassette: p_clean.clone(),
+                rescan: false,
+                redact: RedactArgs {
+                    redact_regex: vec!["[".to_string()],
+                },
+            },
+        })
+        .await;
+        assert!(res.is_err());
         std::fs::remove_file(&p_clean).ok();
     }
 }

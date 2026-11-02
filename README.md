@@ -111,8 +111,12 @@ Options verified from `--help`:
 
 - `--cassette <CASSETTE>` (required)
 - `--bind <BIND>` (default: `127.0.0.1:8787`)
-- `--chaos-rate-limit-prob <PROB>` (inject HTTP 429 faults with this
-  probability; replay mode only)
+- `--chaos-profile <PROFILE>` (`http-429`, `latency`, `truncated`,
+  `drop-field`, `service-503`) with `--chaos-probability <PROB>`
+  (both required together; `--chaos-seed` default `42`,
+  `--chaos-delay-ms` for `latency` only, default `500`,
+  `--chaos-keep-ratio` for `truncated` only, default `0.5`,
+  `--chaos-field` required for `drop-field`)
 - `--mode <MODE>` (`replay`, `record`; default: `replay`)
 - `--upstream <BASE_URL>` (required in record mode, e.g.
   `http://127.0.0.1:8000`)
@@ -120,9 +124,20 @@ Options verified from `--help`:
   record mode creates a fresh cassette)
 
 The replay server serves OpenAI-compatible paths under `/v1` and MCP HTTP
-calls under `/mcp/call`. A request with no matching recorded node returns
+calls under `/mcp`. A request with no matching recorded node returns
 HTTP `412` (`CHRONOSTRACE_REPLAY_MISS`). Only POST routes exist:
-`/v1/chat/completions`, `/v1/messages`, and `/mcp/call`.
+
+| Route | Kind |
+| ----- | ---- |
+| `/v1/chat/completions` | LLM completion |
+| `/v1/messages` | LLM completion (Anthropic Messages) |
+| `/v1/responses` | LLM completion (OpenAI Responses API) |
+| `/mcp/call` | MCP tool call |
+| `/mcp` | MCP tool call (Streamable HTTP) |
+
+Explicitly unsupported: GET routes (including SSE GET streams),
+websockets, file uploads, batch APIs, and non-POST methods on the
+routes above (unknown paths return 404, wrong methods 405).
 Parallel HTTP clients should send distinct `X-ChronosTrace-Session`
 header values; each session gets its own DAG parent pointer, while
 requests without the header share the default pointer.
@@ -137,18 +152,23 @@ chronostrace replay --mode record --upstream http://127.0.0.1:8000 \
 In record mode the same server becomes a recording proxy: requests are
 forwarded to the live upstream, the client sees the upstream response
 verbatim, and the scrubbed request/response pair is appended to the
-cassette as a new node. JSON responses are stored as-is; SSE responses
-(`text/event-stream`) are stored as a chunk list under the
-`_chronostrace_sse` marker in the node's response payload, and replay
-streams those chunks back as `text/event-stream`. Only `Authorization`
-and `Content-Type` are forwarded upstream, and no header is ever stored
-in a cassette. Non-2xx upstream responses pass through to the client
-but are never recorded: replay serves recorded nodes with 200, so
-recording an error would replay it as a success. Recording stops on
-Ctrl+C / SIGTERM — that is the save point, when the cassette is written
-once, atomically. Appending to an existing cassette continues the
-recorded trajectory from its last node. MCP stdio recording is available
-separately via `mcp-wrap --mode record` below.
+cassette as a new node. The original request is forwarded; only the
+scrubbed copy is stored, so a credential the upstream needs still
+works while the cassette never contains it. Forwarded headers are
+limited to an allowlist (`authorization`, `x-api-key`,
+`anthropic-version`, `anthropic-beta`); no header is ever stored in a
+cassette. JSON responses are stored as-is; SSE responses
+(`text/event-stream`) are streamed to the client as they arrive and
+stored as a structured event list (event/id/retry/data) under the
+`_chronostrace_sse` marker, and replay re-serializes those events.
+Non-2xx upstream responses are recorded with their status and safe
+response headers (`content-type`, `retry-after`, `x-request-id`) and
+replay reproduces that status; non-JSON error bodies are stored as
+text. Recording stops on Ctrl+C / SIGTERM — that is the save point,
+when the cassette is written once, atomically. Appending to an existing
+cassette continues the recorded trajectory from its last node. MCP
+stdio recording is available separately via `mcp-wrap --mode record`
+below.
 
 Limitations: the record client connects directly (no environment
 proxies) and never follows redirects. Chaos fault injection applies to
@@ -170,7 +190,9 @@ Options verified from `--help`:
 - `--mode <MODE>` (`record`, `replay`, `passthrough`; default: `replay`)
 - `--similarity-threshold <THRESHOLD>` (default: `0.85`)
 - `--simulate-latency`
-- `--chaos-service-outage-prob <PROB>`
+- `--chaos-profile <PROFILE>` with `--chaos-probability <PROB>` (same
+  unified flags as `replay` above; injected errors surface as MCP
+  `isError: true` tool frames)
 - Child command after `--`
 
 On replay, a miss returns a JSON-RPC error with code `-32004`.
@@ -254,24 +276,51 @@ Xorshift64* generator with probability clamped to `[0.0, 1.0]`:
 | `TruncatedJsonPayload { keep_ratio }` | Truncate JSON output at `keep_ratio`, clamped to `[0.1, 0.9]`, at a UTF-8 boundary |
 | `DropSchemaField { field_name }` | Recursively remove `field_name` from the response JSON tree |
 
-The HTTP replay path exposes rate-limit chaos via
-`--chaos-rate-limit-prob`, and the MCP stdio path exposes outage chaos
-via `--chaos-service-outage-prob`.
+Both `replay` (HTTP) and `mcp-wrap` (stdio) expose the same chaos
+surface: `--chaos-profile` (`http-429`, `latency`, `truncated`,
+`drop-field`, `service-503`) plus `--chaos-probability`, with a
+deterministic `--chaos-seed` (default `42`). Invalid combinations
+fail fast (profile without probability, per-profile options on the
+wrong profile, `drop-field` without `--chaos-field`).
+
+Support matrix, proven by tests: all five profiles work through HTTP
+replay and through MCP stdio frames (where injected errors surface
+as `isError: true` tool frames). SSE streams explicitly ignore chaos
+(they replay recorded events verbatim). The old single-purpose
+flags (`--chaos-rate-limit-prob`, `--chaos-service-outage-prob`)
+were removed; the Python/TS SDK option names (`chaos_rate_limit_prob`,
+`chaosRateLimitProb`, `chaosServiceOutageProb`) still exist and now
+translate to the unified flags.
 
 ## Secret scrubbing
 
 `chronostrace-scrub` redacts, before a cassette is written:
 
 - sensitive field names (for example API keys, authorization, cookies,
-  secrets, passwords, and tokens),
-- key patterns (including `sk-` and `gh[pousr]_` style tokens),
+  secrets, passwords, `passwd`/`pwd`, and token keys: exact `token`,
+  `*_token` such as `refresh_token`/`id_token`/`access_token`, and
+  `token_*` — deliberately not a bare substring, so usage counts
+  like `max_tokens` and `tokens_used` survive),
+- key patterns (including `sk-` and `sk-ant-` Anthropic keys,
+  `gh[pousr]_` style tokens, and JWTs),
 - authorization headers and PEM blocks,
 - tokens of at least 32 characters whose Shannon entropy is at least
   `4.25` bits per character (HTTP(S) URLs excluded).
 
-Scrubber policy version `1.1.0-entropy-regex` and the redaction count are
+Custom patterns can be added per command with repeatable
+`--redact-regex <REGEX>` (on `replay`, `mcp-wrap`, and `verify`;
+matches are replaced with `[REDACTED_CUSTOM]`, and an invalid regex
+is a hard error).
+
+Scrubber policy version `1.2.0-entropy-regex-jwt` and the redaction count are
 recorded in cassette metadata. Cassettes are marked `scrubbed` only after
 scrubbing is applied.
+
+Documented limits (not defects): short low-entropy secrets in unkeyed
+fields cannot be detected without unacceptable false positives;
+encoded secrets are caught only as standalone high-entropy tokens;
+split or encrypted secrets are out of scope. `verify --rescan` is a
+best-effort re-check, not proof that no secret is present.
 
 Residual risk, documented in
 [`SECURITY_THREAT_MODEL.md`](./SECURITY_THREAT_MODEL.md): regex plus

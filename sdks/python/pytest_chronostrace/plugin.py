@@ -47,7 +47,7 @@ def _chronostrace_harness(request, monkeypatch):
 
     cmd = ["chronostrace", "replay", "--cassette", str(cassette_path), "--bind", bind_addr]
     if chaos_prob is not None:
-        cmd.extend(["--chaos-rate-limit-prob", str(chaos_prob)])
+        cmd.extend(["--chaos-profile", "http-429", "--chaos-probability", str(chaos_prob)])
 
     proc = subprocess.Popen(
         cmd,

@@ -42,7 +42,21 @@
           "structural_tool_hash": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
           "safety_critical_hash": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
           "request_payload": { "type": "object" },
-          "response_payload": { "type": "object" },
+          "response_payload": {
+            "description": "Recorded response body: a JSON value for JSON responses, or a plain string for recorded non-JSON (e.g. text) error bodies.",
+            "type": ["object", "array", "string", "number", "boolean", "null"]
+          },
+          "response_status": {
+            "description": "HTTP status captured at record time. Absent for nodes recorded before status capture and for MCP nodes; those replay as 200.",
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599
+          },
+          "response_headers": {
+            "description": "Safe upstream response headers captured at record time (content-type, retry-after, x-request-id only).",
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
           "recorded_latency_ms": { "type": "integer", "minimum": 0 }
         }
       }
