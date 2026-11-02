@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -157,14 +158,27 @@ impl Cassette {
         }
 
         let yaml = serde_yaml::to_string(self)?;
-        let tmp_path = target_path.with_extension(format!("ctrace.{}.tmp", std::process::id()));
-        {
+        // The temporary name must be unique per write, not just per
+        // process: two concurrent writes from the same process to the
+        // same target previously shared one PID-only temp path, so they
+        // overwrote each other's bytes and the last rename won. A
+        // process-wide atomic counter closes that collision on every
+        // platform, including Windows.
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path =
+            target_path.with_extension(format!("ctrace.{}.{}.tmp", std::process::id(), unique));
+        let write_result = (|| -> Result<(), TraceError> {
             let mut file = File::create(&tmp_path)?;
             file.write_all(yaml.as_bytes())?;
             file.sync_all()?;
+            fs::rename(&tmp_path, target_path)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&tmp_path);
         }
-        fs::rename(&tmp_path, target_path)?;
-        Ok(())
+        write_result
     }
 
     pub fn validate_dag(&self) -> Result<(), TraceError> {
@@ -611,5 +625,53 @@ mod tests {
             1,
         );
         assert!(cassette.validate_dag().is_ok());
+    }
+
+    #[test]
+    fn concurrent_saves_to_same_target_all_succeed_and_leave_valid_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "chronostrace-concurrent-save-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("shared.ctrace");
+
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let target = target.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..10 {
+                    let mut cassette = Cassette::new(format!("writer-{t}"), 0.80);
+                    let tools = json!([{"name": "noop"}]);
+                    cassette.record_node(
+                        None,
+                        InteractionKind::McpToolCall,
+                        "root",
+                        &tools,
+                        json!({"tools": tools, "iter": i}),
+                        json!({"ok": true}),
+                        1,
+                    );
+                    cassette.save_to_file(&target).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The surviving file must be one complete, valid cassette, and no
+        // temporary file may be left behind.
+        let loaded = Cassette::load_from_file(&target).unwrap();
+        assert_eq!(loaded.nodes.len(), 1);
+        assert!(loaded.validate_dag().is_ok());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

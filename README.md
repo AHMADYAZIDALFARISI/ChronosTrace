@@ -75,6 +75,15 @@ cargo build --release --package chronostrace-cli
 The binary is named `chronostrace` (single executable, via `[[bin]]` in
 `crates/chronostrace-cli/Cargo.toml`).
 
+## Distribution status
+
+No package is published to PyPI, npm, or crates.io (see
+[`SECURITY.md`](./SECURITY.md)). Install from source as above; the
+Python and TypeScript SDKs are used from this repository (see
+[SDKs](#sdks)). The package names in the manifests
+(`pytest-chronostrace`, `@chronostrace/test`, `chronostrace-cli`) are
+not installable from registries yet.
+
 ## CLI reference
 
 ```text
@@ -84,7 +93,7 @@ Commands:
   replay    Start deterministic offline HTTP replay proxy for LLM & MCP calls
   mcp-wrap  Wrap an MCP stdio server for recording, offline replay, or chaos injection
   diff      Compare two .ctrace cassettes and detect trajectory regressions
-  verify    Verify cassette integrity and confirm scrubbing metadata
+  verify    Verify cassette integrity and scrub metadata flag (--rescan re-checks payloads)
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -109,6 +118,16 @@ The replay server serves OpenAI-compatible paths under `/v1` and MCP HTTP
 calls under `/mcp/call`. A request with no matching recorded node returns
 HTTP `412` (`CHRONOSTRACE_REPLAY_MISS`).
 
+Scope: the replay server is replay-only. There is no HTTP record mode:
+requests are never forwarded to a live upstream, and the server writes
+no cassette. Responses are served as a single JSON body; SSE streaming
+(`stream: true`) is not supported. Only POST routes exist:
+`/v1/chat/completions`, `/v1/messages`, and `/mcp/call`. Recording is
+available for MCP stdio servers via `mcp-wrap --mode record` below.
+Parallel HTTP clients should send distinct `X-ChronosTrace-Session`
+header values; each session gets its own DAG parent pointer, while
+requests without the header share the default pointer.
+
 ### `mcp-wrap`
 
 ```bash
@@ -129,6 +148,11 @@ Options verified from `--help`:
 - Child command after `--`
 
 On replay, a miss returns a JSON-RPC error with code `-32004`.
+
+`mcp-wrap` serves one session on one stdio stream; it is not a
+multi-client server. In record mode, recorded nodes are chained in the
+order the host issued requests, even if the child server answers them
+out of order.
 
 ### `diff`
 
@@ -155,11 +179,17 @@ Exit codes:
 
 ```bash
 chronostrace verify --cassette cassette.ctrace
+chronostrace verify --cassette cassette.ctrace --rescan
 ```
 
 Loads a cassette, validates its DAG structure, and prints a summary
-including the cassette id, node count, similarity threshold, and whether
-it is marked scrubbed.
+including the cassette id, node count, similarity threshold, and the
+scrub metadata flag. By default this confirms the metadata flag only;
+stored payloads are not re-scanned. `verify --rescan` re-runs the
+scrubber over every stored payload and reports any secret-pattern or
+high-entropy hits that remain (exit code 2 when hits are found). A
+clean rescan is a best-effort check, not proof that no secret is
+present.
 
 ## Three-tier matching
 
@@ -232,7 +262,7 @@ list of DAG nodes linked by `parent_id`. Nodes carry the exact request
 hash, prompt SimHash, structural tool hash, request and response
 payloads, and recorded latency.
 
-Writes are atomic (temporary file, sync, rename) and DAG validation
+Writes are atomic (unique temporary file per write, sync, rename) and DAG validation
 rejects duplicate nodes, missing parents, self-parents, and cycles.
 
 ## SDKs

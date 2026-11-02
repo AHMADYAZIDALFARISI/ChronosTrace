@@ -4,7 +4,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiffKind {
@@ -69,6 +69,15 @@ pub fn diff_cassettes(baseline: &Cassette, candidate: &Cassette) -> TrajectoryDi
         .max(candidate.metadata.similarity_threshold);
 
     let mut matched_cand_indices = HashSet::new();
+    // Baseline node id -> its position, so parent lookups are O(1).
+    let baseline_pos: HashMap<&str, usize> = baseline
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.node_id.as_str(), i))
+        .collect();
+    // Baseline position -> matched candidate position.
+    let mut base_to_cand: HashMap<usize, usize> = HashMap::new();
     let mut steps = Vec::new();
 
     let mut identical_count = 0;
@@ -84,35 +93,38 @@ pub fn diff_cassettes(baseline: &Cassette, candidate: &Cassette) -> TrajectoryDi
     for (b_idx, base) in baseline.nodes.iter().enumerate() {
         let base_target = extract_target_name(&base.request_payload);
 
-        let aligned_cand_idx = if candidate.nodes.get(b_idx).is_some_and(|c| {
-            !matched_cand_indices.contains(&b_idx)
-                && c.kind == base.kind
-                && extract_target_name(&c.request_payload) == base_target
-        }) {
-            Some(b_idx)
-        } else {
-            candidate.nodes.iter().enumerate().find_map(|(c_idx, c)| {
-                if !matched_cand_indices.contains(&c_idx)
-                    && c.kind == base.kind
-                    && extract_target_name(&c.request_payload) == base_target
-                {
-                    Some(c_idx)
-                } else {
-                    None
-                }
-            })
-        };
-
-        let fallback_idx = aligned_cand_idx.or_else(|| {
-            if b_idx < candidate.nodes.len() && !matched_cand_indices.contains(&b_idx) {
-                Some(b_idx)
+        // Graph-aware alignment: a candidate matches only when it has the
+        // same kind and target AND its parent is the matched counterpart of
+        // the baseline node's parent (or both are roots). Array position is
+        // never consulted. Without the parent check, two nodes with the same
+        // kind and target at different DAG positions could be paired and
+        // reported Identical even though the topology changed.
+        let aligned_cand_idx = candidate.nodes.iter().enumerate().find_map(|(c_idx, c)| {
+            if matched_cand_indices.contains(&c_idx)
+                || c.kind != base.kind
+                || extract_target_name(&c.request_payload) != base_target
+            {
+                return None;
+            }
+            let parent_ok = match (&base.parent_id, &c.parent_id) {
+                (None, None) => true,
+                (Some(bp), Some(cp)) => baseline_pos
+                    .get(bp.as_str())
+                    .and_then(|p_idx| base_to_cand.get(p_idx))
+                    .and_then(|c_mapped| candidate.nodes.get(*c_mapped))
+                    .is_some_and(|n| n.node_id == *cp),
+                _ => false,
+            };
+            if parent_ok {
+                Some(c_idx)
             } else {
                 None
             }
         });
 
-        if let Some(c_idx) = fallback_idx {
+        if let Some(c_idx) = aligned_cand_idx {
             matched_cand_indices.insert(c_idx);
+            base_to_cand.insert(b_idx, c_idx);
             let cand = &candidate.nodes[c_idx];
             let step = compare_node_pair(steps.len(), base, cand, threshold);
             match step.kind {
@@ -418,6 +430,201 @@ mod tests {
         let report = diff_cassettes(&baseline, &candidate);
         assert_eq!(report.steps[0].kind, DiffKind::PromptDriftReconciled);
         assert_eq!(report.steps[1].kind, DiffKind::ToolArgumentMutated);
+        assert!(!report.is_compatible());
+    }
+
+    fn mcp_call(name: &str, args: Value) -> (Value, Value) {
+        let params = json!({ "name": name, "arguments": args });
+        let req = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": params
+        });
+        (params, strip_jsonrpc_id(&req))
+    }
+
+    #[test]
+    fn same_target_different_parents_is_topology_diverged_not_identical() {
+        // Baseline chain: root -> verify -> charge -> verify.
+        // Candidate: root -> verify -> charge, but the second verify is a
+        // sibling of the first (parent = root), not a child of charge.
+        // Same kind and target at the same array index must not pair them.
+        let mut baseline = Cassette::new("chain_baseline", 0.80);
+        let mut candidate = Cassette::new("chain_candidate", 0.80);
+
+        let llm_req = json!({"model": "gpt-4o", "messages": [{"content": "root"}]});
+        let llm_resp = json!({"ok": true});
+        let schema = json!([{"name": "verify_order"}]);
+        let (v_params, v_req) = mcp_call("verify_order", json!({ "order_id": "ORD-900" }));
+        let (c_params, c_req) =
+            mcp_call("charge", json!({ "order_id": "ORD-900", "amount": 50.0 }));
+
+        let b_r = baseline.record_node(
+            None,
+            InteractionKind::LlmCompletion,
+            "root",
+            &schema,
+            llm_req.clone(),
+            llm_resp.clone(),
+            1,
+        );
+        let b_v1 = baseline.record_node(
+            Some(b_r.clone()),
+            InteractionKind::McpToolCall,
+            "tools/call",
+            &v_params,
+            v_req.clone(),
+            json!({"result": "ok"}),
+            1,
+        );
+        let b_ch = baseline.record_node(
+            Some(b_v1.clone()),
+            InteractionKind::McpToolCall,
+            "tools/call",
+            &c_params,
+            c_req.clone(),
+            json!({"result": "ok"}),
+            1,
+        );
+        baseline.record_node(
+            Some(b_ch.clone()),
+            InteractionKind::McpToolCall,
+            "tools/call",
+            &v_params,
+            v_req.clone(),
+            json!({"result": "ok"}),
+            1,
+        );
+
+        let c_r = candidate.record_node(
+            None,
+            InteractionKind::LlmCompletion,
+            "root",
+            &schema,
+            llm_req.clone(),
+            llm_resp.clone(),
+            1,
+        );
+        let c_v1 = candidate.record_node(
+            Some(c_r.clone()),
+            InteractionKind::McpToolCall,
+            "tools/call",
+            &v_params,
+            v_req.clone(),
+            json!({"result": "ok"}),
+            1,
+        );
+        let c_ch = candidate.record_node(
+            Some(c_v1.clone()),
+            InteractionKind::McpToolCall,
+            "tools/call",
+            &c_params,
+            c_req.clone(),
+            json!({"result": "ok"}),
+            1,
+        );
+        // Second verify as a sibling of the first, not a child of charge.
+        candidate.record_node(
+            Some(c_r.clone()),
+            InteractionKind::McpToolCall,
+            "tools/call",
+            &v_params,
+            v_req.clone(),
+            json!({"result": "ok"}),
+            1,
+        );
+        let _ = c_ch;
+
+        let report = diff_cassettes(&baseline, &candidate);
+        assert_eq!(report.steps.len(), 5);
+        assert_eq!(report.steps[0].kind, DiffKind::Identical);
+        assert_eq!(report.steps[1].kind, DiffKind::Identical);
+        assert_eq!(report.steps[2].kind, DiffKind::Identical);
+        // The second verify must not pair with its same-index counterpart:
+        // its parent differs (charge vs root).
+        assert_eq!(report.steps[3].kind, DiffKind::TopologyDiverged);
+        assert!(report.steps[3].candidate_node_id.is_none());
+        assert_eq!(report.steps[4].kind, DiffKind::TopologyDiverged);
+        assert!(report.steps[4].baseline_node_id.is_none());
+        assert_eq!(report.topology_diverged_count, 2);
+        assert!(!report.is_compatible());
+    }
+
+    #[test]
+    fn reordered_steps_are_topology_diverged_not_mispaired() {
+        let mut baseline = Cassette::new("order_baseline", 0.80);
+        let mut candidate = Cassette::new("order_candidate", 0.80);
+
+        let llm_req = json!({"model": "gpt-4o", "messages": [{"content": "root"}]});
+        let schema = json!([{"name": "verify_order"}]);
+        let (v_params, v_req) = mcp_call("verify_order", json!({ "order_id": "ORD-900" }));
+        let (c_params, c_req) =
+            mcp_call("charge", json!({ "order_id": "ORD-900", "amount": 50.0 }));
+
+        let b_r = baseline.record_node(
+            None,
+            InteractionKind::LlmCompletion,
+            "root",
+            &schema,
+            llm_req.clone(),
+            json!({"ok": true}),
+            1,
+        );
+        let b_a = baseline.record_node(
+            Some(b_r.clone()),
+            InteractionKind::McpToolCall,
+            "tools/call",
+            &v_params,
+            v_req.clone(),
+            json!({"result": "ok"}),
+            1,
+        );
+        baseline.record_node(
+            Some(b_a.clone()),
+            InteractionKind::McpToolCall,
+            "tools/call",
+            &c_params,
+            c_req.clone(),
+            json!({"result": "ok"}),
+            1,
+        );
+
+        let c_r = candidate.record_node(
+            None,
+            InteractionKind::LlmCompletion,
+            "root",
+            &schema,
+            llm_req.clone(),
+            json!({"ok": true}),
+            1,
+        );
+        let c_b = candidate.record_node(
+            Some(c_r.clone()),
+            InteractionKind::McpToolCall,
+            "tools/call",
+            &c_params,
+            c_req.clone(),
+            json!({"result": "ok"}),
+            1,
+        );
+        candidate.record_node(
+            Some(c_b.clone()),
+            InteractionKind::McpToolCall,
+            "tools/call",
+            &v_params,
+            v_req.clone(),
+            json!({"result": "ok"}),
+            1,
+        );
+
+        let report = diff_cassettes(&baseline, &candidate);
+        assert_eq!(report.steps[0].kind, DiffKind::Identical);
+        // Both reordered steps are unmatched, not paired with each other.
+        assert_eq!(report.steps[1].kind, DiffKind::TopologyDiverged);
+        assert!(report.steps[1].candidate_node_id.is_none());
+        assert_eq!(report.steps[2].kind, DiffKind::TopologyDiverged);
+        assert!(report.steps[2].candidate_node_id.is_none());
+        assert_eq!(report.topology_diverged_count, 4);
         assert!(!report.is_compatible());
     }
 }

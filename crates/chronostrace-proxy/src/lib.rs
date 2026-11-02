@@ -11,12 +11,18 @@ use chronostrace_chaos::{ChaosEngine, ChaosOutcome};
 use chronostrace_core::{Cassette, InteractionKind, MatchResult};
 use chronostrace_scrub::SecretScrubber;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub struct ProxyState {
     pub cassette: Cassette,
     pub current_parent_id: Option<String>,
+    /// Per-session DAG parents, keyed by the `X-ChronosTrace-Session`
+    /// header. Requests without the header use `current_parent_id`.
+    /// Without this, parallel clients sharing one proxy would advance a
+    /// single global parent pointer and corrupt each other's replays.
+    pub sessions: HashMap<String, Option<String>>,
     pub scrubber: SecretScrubber,
     pub chaos: Option<ChaosEngine>,
 }
@@ -29,23 +35,47 @@ pub fn build_router(state: Arc<Mutex<ProxyState>>) -> Router {
         .with_state(state)
 }
 
+fn session_key(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-chronostrace-session")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 async fn handle_llm_replay(
     State(state): State<Arc<Mutex<ProxyState>>>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    process_interaction(state, InteractionKind::LlmCompletion, payload).await
+    process_interaction(
+        state,
+        InteractionKind::LlmCompletion,
+        session_key(&headers),
+        payload,
+    )
+    .await
 }
 
 async fn handle_mcp_replay(
     State(state): State<Arc<Mutex<ProxyState>>>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    process_interaction(state, InteractionKind::McpToolCall, payload).await
+    process_interaction(
+        state,
+        InteractionKind::McpToolCall,
+        session_key(&headers),
+        payload,
+    )
+    .await
 }
 
 pub async fn process_interaction(
     state: Arc<Mutex<ProxyState>>,
     kind: InteractionKind,
+    session: Option<String>,
     raw_request: Value,
 ) -> (StatusCode, HeaderMap, Json<Value>) {
     let mut headers = HeaderMap::new();
@@ -56,8 +86,15 @@ pub async fn process_interaction(
         let prompt_text = extract_prompt_text(&scrubbed_req);
         let structural_tools = extract_structural_tools(&scrubbed_req);
 
+        // Resolve this request's DAG parent: the named session's pointer,
+        // or the shared default pointer when no session header was sent.
+        let parent_id: Option<String> = match &session {
+            Some(key) => guard.sessions.get(key).cloned().flatten(),
+            None => guard.current_parent_id.clone(),
+        };
+
         let matched = guard.cassette.match_request(
-            &guard.current_parent_id,
+            &parent_id,
             &kind,
             &prompt_text,
             &structural_tools,
@@ -86,7 +123,14 @@ pub async fn process_interaction(
                     .unwrap_or(ChaosOutcome::PassThrough(resp_payload));
                 // Hanya majukan pointer parent DAG apabila fault tidak menggagalkan step dengan HTTP error
                 if !matches!(chaos_res, ChaosOutcome::InjectedError { .. }) {
-                    guard.current_parent_id = Some(node_id);
+                    match &session {
+                        Some(key) => {
+                            guard.sessions.insert(key.clone(), Some(node_id));
+                        }
+                        None => {
+                            guard.current_parent_id = Some(node_id);
+                        }
+                    }
                 }
                 (Ok(()), Some(chaos_res))
             }
@@ -182,6 +226,7 @@ mod tests {
         Arc::new(Mutex::new(ProxyState {
             cassette,
             current_parent_id: None,
+            sessions: HashMap::new(),
             scrubber: SecretScrubber::new(),
             chaos,
         }))
@@ -197,7 +242,7 @@ mod tests {
         });
 
         let (status, _, Json(body)) =
-            process_interaction(state.clone(), InteractionKind::LlmCompletion, req).await;
+            process_interaction(state.clone(), InteractionKind::LlmCompletion, None, req).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["choices"][0]["message"]["content"], "Verified ORD-900");
         assert!(state.lock().unwrap().current_parent_id.is_some());
@@ -213,7 +258,7 @@ mod tests {
         });
 
         let (status, _, Json(body)) =
-            process_interaction(state, InteractionKind::LlmCompletion, mutated_req).await;
+            process_interaction(state, InteractionKind::LlmCompletion, None, mutated_req).await;
         assert_eq!(status, StatusCode::PRECONDITION_FAILED);
         assert_eq!(body["error"], "CHRONOSTRACE_REPLAY_MISS");
     }
@@ -236,7 +281,7 @@ mod tests {
         });
 
         let (status, headers, _) =
-            process_interaction(state.clone(), InteractionKind::LlmCompletion, req).await;
+            process_interaction(state.clone(), InteractionKind::LlmCompletion, None, req).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             headers.get(header::RETRY_AFTER).unwrap().to_str().unwrap(),
@@ -244,6 +289,114 @@ mod tests {
         );
         // Pointer parent tidak boleh maju jika request gagal karena HTTP 429 sehingga retry berikutnya tetap cocok
         assert!(state.lock().unwrap().current_parent_id.is_none());
+    }
+
+    #[test]
+    fn session_key_parses_header_and_ignores_blank() {
+        let mut headers = HeaderMap::new();
+        assert!(session_key(&headers).is_none());
+        headers.insert(
+            "x-chronostrace-session",
+            HeaderValue::from_static("  session-a  "),
+        );
+        assert_eq!(session_key(&headers).as_deref(), Some("session-a"));
+        headers.insert("x-chronostrace-session", HeaderValue::from_static("   "));
+        assert!(session_key(&headers).is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_sessions_have_independent_dag_parents() {
+        let state = sample_proxy_state(None);
+        let node_id = state.lock().unwrap().cassette.nodes[0].node_id.clone();
+        let req = || {
+            json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "system", "content": "You are a helpful financial refund agent. Verify order ORD-900 for $50."}],
+                "tools": [{"name": "verify_order"}]
+            })
+        };
+
+        // Session A matches the root node and advances only its own pointer.
+        let (status, _, _) = process_interaction(
+            state.clone(),
+            InteractionKind::LlmCompletion,
+            Some("session-a".to_string()),
+            req(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Session B replays the same trajectory independently: its parent
+        // is still None, so it matches the root node again.
+        let (status, _, _) = process_interaction(
+            state.clone(),
+            InteractionKind::LlmCompletion,
+            Some("session-b".to_string()),
+            req(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Session A replaying the same request again now misses: its parent
+        // advanced past the root node, and no child was recorded.
+        let (status, _, _) = process_interaction(
+            state.clone(),
+            InteractionKind::LlmCompletion,
+            Some("session-a".to_string()),
+            req(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            guard.sessions.get("session-a").cloned().flatten(),
+            Some(node_id.clone())
+        );
+        assert_eq!(
+            guard.sessions.get("session-b").cloned().flatten(),
+            Some(node_id)
+        );
+        // The default pointer was never touched by session traffic.
+        assert!(guard.current_parent_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_http_mcp_prompts_get_param_change_misses() {
+        // The HTTP handler derives structural tools from the full params,
+        // so unlike the old stdio extractor it never had the method-only
+        // hole. This test locks that behavior in.
+        let mut cassette = Cassette::new("http_mcp_prompts", 0.80);
+        let req_a = json!({"jsonrpc": "2.0", "method": "prompts/get", "params": {"name": "greeting", "arguments": {}}});
+        let resp = json!({"result": "hello"});
+        cassette.record_node(
+            None,
+            InteractionKind::McpToolCall,
+            &req_a.to_string(),
+            &req_a["params"],
+            req_a.clone(),
+            resp,
+            5,
+        );
+        let state = Arc::new(Mutex::new(ProxyState {
+            cassette,
+            current_parent_id: None,
+            sessions: HashMap::new(),
+            scrubber: SecretScrubber::new(),
+            chaos: None,
+        }));
+        let (status, _, _) = process_interaction(
+            state.clone(),
+            InteractionKind::McpToolCall,
+            None,
+            req_a.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let req_b = json!({"jsonrpc": "2.0", "method": "prompts/get", "params": {"name": "farewell", "arguments": {}}});
+        let (status, _, _) =
+            process_interaction(state, InteractionKind::McpToolCall, None, req_b).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
     }
 
     #[test]

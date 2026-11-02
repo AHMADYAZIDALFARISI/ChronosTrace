@@ -80,6 +80,10 @@ enum Commands {
     Verify {
         #[arg(short, long)]
         cassette: PathBuf,
+        /// Re-scan every stored payload with the scrubber and report any
+        /// secret-pattern or high-entropy hits that remain.
+        #[arg(long, default_value_t = false)]
+        rescan: bool,
     },
 }
 
@@ -123,6 +127,7 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             let state = Arc::new(Mutex::new(ProxyState {
                 cassette: loaded,
                 current_parent_id: None,
+                sessions: std::collections::HashMap::new(),
                 scrubber: SecretScrubber::new(),
                 chaos,
             }));
@@ -190,17 +195,59 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             Ok(ExitCode::from(diff_exit_code(&report, fail_on_divergence)))
         }
 
-        Commands::Verify { cassette } => {
+        Commands::Verify { cassette, rescan } => {
             let loaded = Cassette::load_from_file(&cassette)?;
             println!(
-                "Verified cassette '{}' (v{}): {} DAG nodes, threshold >= {:.2}, scrubbed={}",
+                "Verified cassette '{}' (v{}): {} DAG nodes, threshold >= {:.2}, scrub metadata flag={}",
                 loaded.cassette_id,
                 loaded.version,
                 loaded.nodes.len(),
                 loaded.metadata.similarity_threshold,
                 loaded.metadata.scrubbed
             );
-            Ok(ExitCode::SUCCESS)
+            if !rescan {
+                println!(
+                    "Note: this confirms DAG validity and the scrub metadata flag only; stored payloads were not re-scanned. Use --rescan to re-check payloads."
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+            // Best-effort re-check: run the scrubber over every stored
+            // payload and report anything it still flags. A clean rescan
+            // is not proof that no secret is present: pattern and entropy
+            // matching cannot guarantee full discovery.
+            let scrubber = SecretScrubber::new();
+            let mut flagged: Vec<(String, usize)> = Vec::new();
+            let mut total_hits = 0usize;
+            for node in &loaded.nodes {
+                let mut node_hits = 0usize;
+                for payload in [&node.request_payload, &node.response_payload] {
+                    let before = scrubber.total_redactions();
+                    let scrubbed = scrubber.scrub_json(payload);
+                    let hits = scrubber.total_redactions() - before;
+                    if hits > 0 || scrubbed != *payload {
+                        node_hits += hits.max(1);
+                    }
+                }
+                if node_hits > 0 {
+                    total_hits += node_hits;
+                    flagged.push((node.node_id.clone(), node_hits));
+                }
+            }
+            if flagged.is_empty() {
+                println!(
+                    "Rescan: no remaining secret-pattern or high-entropy hits found in stored payloads (best-effort check, not proof of absence)."
+                );
+                Ok(ExitCode::SUCCESS)
+            } else {
+                println!(
+                    "Rescan: {total_hits} remaining hit(s) in {} node(s):",
+                    flagged.len()
+                );
+                for (node_id, hits) in &flagged {
+                    println!("  {node_id}: {hits} hit(s)");
+                }
+                Ok(ExitCode::from(2))
+            }
         }
     }
 }
@@ -409,6 +456,7 @@ mod tests {
         let res = execute_cli(Cli {
             command: Commands::Verify {
                 cassette: p_base.clone(),
+                rescan: false,
             },
         })
         .await;
@@ -418,6 +466,7 @@ mod tests {
             command: Commands::Verify {
                 cassette: std::env::temp_dir()
                     .join("chronostrace-cli-test-definitely-missing.ctrace"),
+                rescan: false,
             },
         })
         .await;
@@ -425,5 +474,61 @@ mod tests {
 
         std::fs::remove_file(&p_base).ok();
         std::fs::remove_file(&p_bad).ok();
+    }
+
+    #[tokio::test]
+    async fn execute_cli_verify_rescan_flags_planted_secret() {
+        // record_node does not scrub; scrubbing normally happens before
+        // recording. A payload that still contains a secret therefore
+        // simulates a cassette that predates scrubbing or slipped
+        // through it.
+        let mut planted = Cassette::new("rescan_fixture", 0.80);
+        let tools = json!([{"name": "noop"}]);
+        planted.record_node(
+            None,
+            InteractionKind::McpToolCall,
+            "root",
+            &tools,
+            json!({"tools": tools}),
+            json!({"result": "key sk-proj-abcdefghijklmnopqrstuvwx"}),
+            1,
+        );
+        let p_planted = write_cassette("rescan_planted", &planted);
+
+        // Default verify passes: it only confirms DAG validity and the
+        // scrub metadata flag.
+        let res = execute_cli(Cli {
+            command: Commands::Verify {
+                cassette: p_planted.clone(),
+                rescan: false,
+            },
+        })
+        .await;
+        assert_eq!(res.unwrap(), ExitCode::SUCCESS);
+
+        // Rescan must flag the planted secret and exit non-zero.
+        let res = execute_cli(Cli {
+            command: Commands::Verify {
+                cassette: p_planted.clone(),
+                rescan: true,
+            },
+        })
+        .await;
+        assert_eq!(res.unwrap(), ExitCode::from(2));
+
+        // A clean cassette rescans clean.
+        let clean = fixture_cassette("ok", "You are a helpful refund agent.", json!({"ok": true}));
+        let p_clean = write_cassette("rescan_clean", &clean);
+        let res = execute_cli(Cli {
+            command: Commands::Verify {
+                cassette: p_clean.clone(),
+                rescan: true,
+            },
+        })
+        .await;
+        assert_eq!(res.unwrap(), ExitCode::SUCCESS);
+
+        std::fs::remove_file(&p_planted).ok();
+        std::fs::remove_file(&p_clean).ok();
     }
 }

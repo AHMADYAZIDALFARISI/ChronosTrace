@@ -31,6 +31,83 @@ struct InFlightRequest {
     prompt_text: String,
     structural_tools: Value,
     started_at: Instant,
+    seq: u64,
+}
+
+/// A recorded MCP interaction waiting for its turn in request order.
+struct PendingRecord {
+    prompt_text: String,
+    structural_tools: Value,
+    scrubbed_request_no_id: Value,
+    scrubbed_response_no_id: Value,
+    elapsed_ms: u64,
+}
+
+/// Chains recorded MCP nodes in the order the host issued requests, not
+/// the order child responses arrived. A response that arrives early waits
+/// in `pending` until every earlier request has been recorded; without
+/// this, concurrent requests to an async child server would link parents
+/// by response arrival order instead of request causality.
+#[derive(Default)]
+struct OrderedRecorder {
+    next_seq: u64,
+    next_to_record: u64,
+    pending: HashMap<u64, PendingRecord>,
+}
+
+impl OrderedRecorder {
+    fn assign_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
+    }
+
+    fn push(
+        &mut self,
+        seq: u64,
+        record: PendingRecord,
+        cassette: &mut Cassette,
+        current_parent_id: &mut Option<String>,
+    ) {
+        self.pending.insert(seq, record);
+        self.drain(cassette, current_parent_id);
+    }
+
+    fn drain(&mut self, cassette: &mut Cassette, current_parent_id: &mut Option<String>) {
+        while let Some(record) = self.pending.remove(&self.next_to_record) {
+            let new_node_id = cassette.record_node(
+                current_parent_id.clone(),
+                InteractionKind::McpToolCall,
+                &record.prompt_text,
+                &record.structural_tools,
+                record.scrubbed_request_no_id,
+                record.scrubbed_response_no_id,
+                record.elapsed_ms,
+            );
+            *current_parent_id = Some(new_node_id);
+            self.next_to_record += 1;
+        }
+    }
+
+    fn flush(&mut self, cassette: &mut Cassette, current_parent_id: &mut Option<String>) {
+        let mut seqs: Vec<u64> = self.pending.keys().copied().collect();
+        seqs.sort_unstable();
+        for seq in seqs {
+            if let Some(record) = self.pending.remove(&seq) {
+                let new_node_id = cassette.record_node(
+                    current_parent_id.clone(),
+                    InteractionKind::McpToolCall,
+                    &record.prompt_text,
+                    &record.structural_tools,
+                    record.scrubbed_request_no_id,
+                    record.scrubbed_response_no_id,
+                    record.elapsed_ms,
+                );
+                *current_parent_id = Some(new_node_id);
+            }
+        }
+        self.next_to_record = self.next_seq;
+    }
 }
 
 pub async fn run_mcp_stdio_wrapper(
@@ -156,6 +233,7 @@ async fn run_bidirectional_child_proxy(
     let scrubber = SecretScrubber::new();
     let mut current_parent_id: Option<String> = None;
     let mut in_flight: HashMap<String, InFlightRequest> = HashMap::new();
+    let mut recorder = OrderedRecorder::default();
 
     loop {
         tokio::select! {
@@ -203,6 +281,7 @@ async fn run_bidirectional_child_proxy(
                                         prompt_text,
                                         structural_tools,
                                         started_at: Instant::now(),
+                                        seq: recorder.assign_seq(),
                                     },
                                 );
                             }
@@ -228,16 +307,18 @@ async fn run_bidirectional_child_proxy(
                                         let scrubbed_resp_no_id =
                                             scrubber.scrub_json(&strip_jsonrpc_id(&raw_resp));
 
-                                        let new_node_id = cassette.record_node(
-                                            current_parent_id.clone(),
-                                            InteractionKind::McpToolCall,
-                                            &tracked.prompt_text,
-                                            &tracked.structural_tools,
-                                            tracked.scrubbed_request_no_id,
-                                            scrubbed_resp_no_id,
-                                            elapsed_ms,
+                                        recorder.push(
+                                            tracked.seq,
+                                            PendingRecord {
+                                                prompt_text: tracked.prompt_text,
+                                                structural_tools: tracked.structural_tools,
+                                                scrubbed_request_no_id: tracked.scrubbed_request_no_id,
+                                                scrubbed_response_no_id: scrubbed_resp_no_id,
+                                                elapsed_ms,
+                                            },
+                                            &mut cassette,
+                                            &mut current_parent_id,
                                         );
-                                        current_parent_id = Some(new_node_id);
                                     }
                                 }
                             }
@@ -251,6 +332,10 @@ async fn run_bidirectional_child_proxy(
             }
         }
     }
+
+    // Record any buffered responses in request order, even if an earlier
+    // response never arrived.
+    recorder.flush(&mut cassette, &mut current_parent_id);
 
     cassette.mark_scrubbed(scrubber.policy_version(), scrubber.total_redactions());
     persist_cassette(&cassette, &config.cassette_path)?;
@@ -270,12 +355,20 @@ pub fn extract_mcp_matching_features(scrubbed_no_id: &Value) -> (String, Value) 
         .unwrap_or("");
     let params = scrubbed_no_id.get("params").cloned().unwrap_or(Value::Null);
 
-    if method == "sampling/createMessage" || method == "prompts/get" {
-        return (params.to_string(), json!({ "method": method }));
-    }
-
+    // Every method, including prompts/get and sampling/createMessage, carries
+    // its full params in the structural payload. The MCP matcher accepts a
+    // node on a structural-hash hit alone (after the exact-hash tier), so a
+    // method-only structural payload would let two calls with different
+    // parameters match each other and serve the wrong recorded response.
+    // tools/call already behaved this way; this makes the other methods
+    // consistent with it.
+    let prompt_text = if method == "sampling/createMessage" || method == "prompts/get" {
+        params.to_string()
+    } else {
+        format!("{method}:{params}")
+    };
     (
-        format!("{method}:{params}"),
+        prompt_text,
         json!({
             "method": method,
             "params": params
@@ -337,4 +430,144 @@ async fn write_jsonrpc_line(
     serialized.push(b'\n');
     stdout.write_all(&serialized).await?;
     stdout.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mcp_req(method: &str, params: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+    }
+
+    #[test]
+    fn prompts_get_structural_includes_full_params() {
+        let a = extract_mcp_matching_features(&strip_jsonrpc_id(&mcp_req(
+            "prompts/get",
+            json!({"name": "greeting", "arguments": {"style": "formal"}}),
+        )));
+        let b = extract_mcp_matching_features(&strip_jsonrpc_id(&mcp_req(
+            "prompts/get",
+            json!({"name": "farewell", "arguments": {"style": "formal"}}),
+        )));
+        assert_ne!(a.1, b.1);
+        assert_eq!(a.1["params"]["name"], "greeting");
+        // Identical params must still produce an identical structural payload.
+        let a2 = extract_mcp_matching_features(&strip_jsonrpc_id(&mcp_req(
+            "prompts/get",
+            json!({"name": "greeting", "arguments": {"style": "formal"}}),
+        )));
+        assert_eq!(a.1, a2.1);
+    }
+
+    #[test]
+    fn sampling_create_message_structural_includes_full_params() {
+        let a = extract_mcp_matching_features(&strip_jsonrpc_id(&mcp_req(
+            "sampling/createMessage",
+            json!({"messages": [{"role": "user", "content": "hello"}]}),
+        )));
+        let b = extract_mcp_matching_features(&strip_jsonrpc_id(&mcp_req(
+            "sampling/createMessage",
+            json!({"messages": [{"role": "user", "content": "goodbye"}]}),
+        )));
+        assert_ne!(a.1, b.1);
+    }
+
+    #[test]
+    fn prompts_get_param_change_is_a_replay_miss_not_a_match() {
+        let mut cassette = Cassette::new("prompts_get_regression", 0.80);
+        let req_a = strip_jsonrpc_id(&mcp_req(
+            "prompts/get",
+            json!({"name": "greeting", "arguments": {}}),
+        ));
+        let (prompt_a, structural_a) = extract_mcp_matching_features(&req_a);
+        cassette.record_node(
+            None,
+            InteractionKind::McpToolCall,
+            &prompt_a,
+            &structural_a,
+            req_a.clone(),
+            json!({"result": "hello"}),
+            5,
+        );
+
+        // Replaying the identical call still matches exactly.
+        let (prompt_a2, structural_a2) = extract_mcp_matching_features(&req_a);
+        assert!(matches!(
+            cassette.match_request(
+                &None,
+                &InteractionKind::McpToolCall,
+                &prompt_a2,
+                &structural_a2,
+                &req_a
+            ),
+            Ok(MatchResult::Exact(_))
+        ));
+
+        // Replaying with a different prompt name at the same DAG position
+        // must miss. Before the fix, the method-only structural payload made
+        // this return the recorded "greeting" response as an Exact match.
+        let req_b = strip_jsonrpc_id(&mcp_req(
+            "prompts/get",
+            json!({"name": "farewell", "arguments": {}}),
+        ));
+        let (prompt_b, structural_b) = extract_mcp_matching_features(&req_b);
+        assert!(cassette
+            .match_request(
+                &None,
+                &InteractionKind::McpToolCall,
+                &prompt_b,
+                &structural_b,
+                &req_b
+            )
+            .is_err());
+    }
+
+    fn pending_record(name: &str) -> PendingRecord {
+        PendingRecord {
+            prompt_text: format!("tools/call:{name}"),
+            structural_tools: json!({"method": "tools/call", "params": {"name": name}}),
+            scrubbed_request_no_id: json!({"method": "tools/call", "params": {"name": name}}),
+            scrubbed_response_no_id: json!({"result": name}),
+            elapsed_ms: 1,
+        }
+    }
+
+    #[test]
+    fn ordered_recorder_chains_in_request_order_despite_response_order() {
+        let mut cassette = Cassette::new("order_recorder", 0.80);
+        let mut parent: Option<String> = None;
+        let mut recorder = OrderedRecorder::default();
+        let s0 = recorder.assign_seq();
+        let s1 = recorder.assign_seq();
+        // The second response arrives first: nothing is recorded yet.
+        recorder.push(s1, pending_record("second"), &mut cassette, &mut parent);
+        assert!(cassette.nodes.is_empty());
+        assert!(parent.is_none());
+        // The first response arrives: both drain in request order.
+        recorder.push(s0, pending_record("first"), &mut cassette, &mut parent);
+        assert_eq!(cassette.nodes.len(), 2);
+        assert!(cassette.nodes[0].parent_id.is_none());
+        assert_eq!(
+            cassette.nodes[1].parent_id,
+            Some(cassette.nodes[0].node_id.clone())
+        );
+        assert_eq!(parent, Some(cassette.nodes[1].node_id.clone()));
+        assert_eq!(cassette.nodes[0].response_payload["result"], "first");
+        assert_eq!(cassette.nodes[1].response_payload["result"], "second");
+    }
+
+    #[test]
+    fn ordered_recorder_flush_drains_leftovers() {
+        let mut cassette = Cassette::new("order_flush", 0.80);
+        let mut parent: Option<String> = None;
+        let mut recorder = OrderedRecorder::default();
+        let _s0 = recorder.assign_seq();
+        let s1 = recorder.assign_seq();
+        recorder.push(s1, pending_record("second"), &mut cassette, &mut parent);
+        assert!(cassette.nodes.is_empty());
+        recorder.flush(&mut cassette, &mut parent);
+        assert_eq!(cassette.nodes.len(), 1);
+        assert_eq!(cassette.nodes[0].response_payload["result"], "second");
+    }
 }
