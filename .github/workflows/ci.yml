@@ -168,3 +168,28 @@ jobs:
           npm install
           npm run typecheck
           npm test
+
+  msrv:
+    name: MSRV (Rust 1.88)
+    # SECOND AUDIT P1: stable-only CI is insufficient. This job
+    # pins the declared minimum toolchain and runs the full
+    # workspace suite against the locked dependency set, so a
+    # future dependency bump that raises the floor fails here
+    # instead of silently invalidating the MSRV claim.
+    # NOTE: this workflow triggers only on push/PR to master/main,
+    # so this job first runs when this branch merges, not on the
+    # branch push itself. The 1.88 gate was verified locally
+    # before merging (see SECOND_AUDIT_FINDINGS.md).
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.88 toolchain
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Cache Cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace tests on the MSRV toolchain
+        run: cargo test --workspace --locked

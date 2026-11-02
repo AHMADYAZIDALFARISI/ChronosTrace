@@ -383,7 +383,7 @@ MCP 503 circuit breaking, and argument-mutation detection via diff.
 
 See [`docs/compatibility.md`](./docs/compatibility.md):
 
-- Rust MSRV: 1.78+ (Edition 2021)
+- Rust MSRV: 1.88+ (Edition 2021)
 - Python SDK: Python 3.10, 3.11, 3.12
 - TypeScript SDK: Node.js 20.x, 22.x
 - Operating systems: Linux (`x86_64`, `aarch64`), macOS (`x86_64`,
