@@ -195,6 +195,19 @@ enum Commands {
         /// Upstream base URL for record mode, e.g. http://127.0.0.1:8000.
         #[arg(long)]
         upstream: Option<String>,
+        /// Upstream timeout in seconds for record mode. 0 (default)
+        /// disables timeouts, preserving the previous behavior
+        /// (an unresponsive upstream could stall recording
+        /// indefinitely). A positive value bounds waiting for
+        /// response headers on every upstream request, and bounds
+        /// the full body read for non-SSE responses. SSE streams
+        /// are exempt from a total timeout once headers arrive, so
+        /// a long stream keeps running. On timeout, recording
+        /// fails with 504 CHRONOSTRACE_UPSTREAM_TIMEOUT and no
+        /// cassette node is recorded. Replay never contacts the
+        /// upstream and is unaffected by this flag.
+        #[arg(long, default_value_t = 0)]
+        upstream_timeout_secs: u64,
         /// Similarity threshold for a cassette created fresh in record
         /// mode (ignored when appending to an existing file).
         #[arg(long, default_value_t = 0.85)]
@@ -271,12 +284,13 @@ async fn execute_cli(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             redact,
             mode,
             upstream,
+            upstream_timeout_secs,
             similarity_threshold,
         } => {
             let is_record = matches!(mode, ReplayModeArg::Record);
             let upstream_target = if is_record {
                 let base = upstream.ok_or("record mode requires --upstream <base-url>")?;
-                Some(UpstreamTarget::new(&base)?)
+                Some(UpstreamTarget::with_timeout(&base, upstream_timeout_secs)?)
             } else {
                 None
             };
@@ -568,6 +582,7 @@ mod tests {
                 redact,
                 mode,
                 upstream,
+                upstream_timeout_secs,
                 similarity_threshold,
             } => {
                 assert_eq!(cassette, PathBuf::from("a.ctrace"));
@@ -577,6 +592,7 @@ mod tests {
                 assert!(redact.redact_regex.is_empty());
                 assert!(matches!(mode, ReplayModeArg::Replay));
                 assert!(upstream.is_none());
+                assert_eq!(upstream_timeout_secs, 0);
                 assert_eq!(similarity_threshold, 0.85);
             }
             _ => panic!("expected Replay"),
@@ -591,12 +607,20 @@ mod tests {
             "record",
             "--upstream",
             "http://127.0.0.1:9000",
+            "--upstream-timeout-secs",
+            "120",
         ])
         .unwrap();
         match cli.command {
-            Commands::Replay { mode, upstream, .. } => {
+            Commands::Replay {
+                mode,
+                upstream,
+                upstream_timeout_secs,
+                ..
+            } => {
                 assert!(matches!(mode, ReplayModeArg::Record));
                 assert_eq!(upstream.as_deref(), Some("http://127.0.0.1:9000"));
+                assert_eq!(upstream_timeout_secs, 120);
             }
             _ => panic!("expected Replay"),
         }
